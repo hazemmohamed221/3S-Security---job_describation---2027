@@ -1,0 +1,1809 @@
+--- a/database.py
++++ b/database.py
+@@ -12,6 +12,7 @@
+ from backups import backup_before_startup
+ import openpyxl
+ from docx_parser import parse_jd_docx
++import governance
+ 
+ DB_PATH = os.environ.get("JD_DB_PATH", os.path.join(os.path.dirname(__file__), "job_descriptions.db"))
+ 
+@@ -165,7 +166,7 @@
+         external_relations TEXT,
+         approvals TEXT,
+         source_file TEXT,
+-        status TEXT DEFAULT 'قيد المراجعة',
++        status TEXT DEFAULT 'مسودة',
+         version INTEGER DEFAULT 1,
+         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+@@ -235,6 +236,9 @@
+     """)
+ 
+     conn.commit()
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        governance.migrate(conn)
+ 
+     cur.execute("SELECT COUNT(*) as cnt FROM job_descriptions")
+     jd_count = cur.fetchone()['cnt']
+@@ -249,17 +253,21 @@
+     """Inserts a parsed JD dictionary and its accountabilities into DB with auto Arabic translation."""
+     cur = conn.cursor()
+ 
+-    raw_title = parsed.get('title', 'بطاقة وصف وظيفي جديدة').strip()
+-    title = TITLE_MAP.get(raw_title, raw_title)
+-
+-    raw_dept = parsed.get('department', '').strip()
+-    dept = DEPT_MAP.get(raw_dept, raw_dept if raw_dept else 'الإدارة العامة')
+-
+-    raw_rep = parsed.get('reports_to', '').strip()
+-    reports_to = REPORTS_MAP.get(raw_rep, raw_rep if raw_rep else 'مجلس الإدارة')
+-
+-    dimensions = translate_dimensions(parsed.get('dimensions', ''))
+-    qualifications = translate_qualifications(parsed.get('qualifications', ''))
++    system_export = parsed.get('format_version') == 2
++    raw_title = parsed.get('title', 'بطاقة وصف وظيفي جديدة')
++    raw_title = raw_title if system_export else raw_title.strip()
++    title = raw_title if system_export else TITLE_MAP.get(raw_title, raw_title)
++
++    raw_dept = parsed.get('department', '')
++    raw_dept = raw_dept if system_export else raw_dept.strip()
++    dept = raw_dept if system_export else DEPT_MAP.get(raw_dept, raw_dept if raw_dept else 'الإدارة العامة')
++
++    raw_rep = parsed.get('reports_to', '')
++    raw_rep = raw_rep if system_export else raw_rep.strip()
++    reports_to = raw_rep if system_export else REPORTS_MAP.get(raw_rep, raw_rep if raw_rep else 'مجلس الإدارة')
++
++    dimensions = parsed.get('dimensions', '') if system_export else translate_dimensions(parsed.get('dimensions', ''))
++    qualifications = parsed.get('qualifications', '') if system_export else translate_qualifications(parsed.get('qualifications', ''))
+ 
+     cur.execute("""
+     INSERT INTO job_descriptions (
+@@ -272,7 +280,7 @@
+         parsed.get('job_code', ''),
+         title,
+         dept,
+-        parsed.get('sector', 'الإدارة العامة والمجموعة') or 'الإدارة العامة والمجموعة',
++        parsed.get('sector', '') if system_export else (parsed.get('sector') or 'الإدارة العامة والمجموعة'),
+         reports_to,
+         parsed.get('purpose', ''),
+         dimensions,
+@@ -292,13 +300,14 @@
+         cur.execute("""
+         INSERT INTO accountabilities (jd_id, item_order, description, kpi, version, is_active)
+         VALUES (?, ?, ?, ?, 1, 1)
+-        """, (jd_id, idx + 1, acc.get('description', ''), acc.get('kpi', '')))
++        """, (jd_id, acc.get('item_order', idx + 1), acc.get('description', ''), acc.get('kpi', '')))
+ 
+     cur.execute("""
+     INSERT INTO jd_audit_trail (jd_id, section_name, action, new_text, changed_by, notes)
+     VALUES (?, 'كامل الوثيقة', 'إدراج أولي', ?, ?, ?)
+     """, (jd_id, f"استيراد الوصف الوظيفي من الملف: {source_file}", changed_by, notes))
+ 
++    governance.bind_review(conn, jd_id)
+     if commit:
+         conn.commit()
+     return jd_id
+@@ -379,6 +388,7 @@
+ 
+ 
+ FIELD_MAP = {
++    "كود الوظيفة": "job_code", "Job Code": "job_code",
+     "الهدف العام من الوظيفة": "purpose", "Job Purpose": "purpose",
+     "أبعاد الوظيفة": "dimensions", "Job Dimensions": "dimensions",
+     "إطار العمل وحدود اتخاذ القرارات": "frameworks", "Frameworks & Authority": "frameworks",
+@@ -431,6 +441,8 @@
+     ORDER BY j.title ASC
+     """)
+     rows = [dict(r) for r in cur.fetchall()]
++    for row in rows:
++        row['status'] = governance.STATUS_ALIASES.get(row['status'], row['status'])
+     conn.close()
+     return rows
+ 
+@@ -441,7 +453,11 @@
+     cur.execute("SELECT * FROM job_descriptions WHERE id = ?", (jd_id,))
+     row = cur.fetchone()
+     conn.close()
+-    return dict(row) if row else None
++    if not row:
++        return None
++    result = dict(row)
++    result['status'] = governance.STATUS_ALIASES.get(result['status'], result['status'])
++    return result
+ 
+ 
+ def get_accountabilities(jd_id):
+@@ -469,8 +485,30 @@
+ def create_or_update_jd(parsed_jd, source_file, *, actor_id):
+     with _write_connection() as conn:
+         actor = _require_actor(conn, actor_id, admin=True)
+-        return _insert_parsed_jd(conn, parsed_jd, source_file, actor['full_name'], commit=False,
+-                                 notes=f"تمت الإضافة من ملف Word; actor_id={actor['id']}")
++        if parsed_jd.get('format_version') == 2:
++            import_hash = governance.digest(governance.encode({
++                'fields': {f: parsed_jd.get(f) or '' for f in governance.CONTENT_FIELDS if f != 'source_file'},
++                'accountabilities': parsed_jd.get('accountabilities', []),
++            }))
++            existing = conn.execute('SELECT * FROM job_descriptions WHERE id=?',
++                                    (parsed_jd.get('portal_card_id'),)).fetchone()
++            existing = conn.execute('SELECT * FROM job_descriptions WHERE import_hash=? ORDER BY id LIMIT 1',
++                                    (import_hash,)).fetchone() or existing
++            if existing:
++                fields_match = all((existing[f] or '') == (parsed_jd.get(f) or '')
++                                   for f in governance.CONTENT_FIELDS if f != 'source_file')
++                current = [(r['item_order'], r['description'], r['kpi'] or '') for r in conn.execute(
++                    'SELECT * FROM accountabilities WHERE jd_id=? AND is_active=1 ORDER BY item_order,id', (existing['id'],))]
++                incoming = [(a['item_order'], a['description'], a.get('kpi') or '')
++                            for a in parsed_jd.get('accountabilities', [])]
++                if fields_match and current == incoming:
++                    return existing['id']
++                raise ValueError('تختلف البطاقة المستوردة عن البطاقة المسجلة. يرجى استخدام طلب تعديل لحفظ المراجعة.')
++        jd_id = _insert_parsed_jd(conn, parsed_jd, source_file, actor['full_name'], commit=False,
++                                  notes=f"تمت الإضافة من ملف Word; actor_id={actor['id']}")
++        if parsed_jd.get('format_version') == 2:
++            conn.execute('UPDATE job_descriptions SET import_hash=? WHERE id=?', (import_hash, jd_id))
++        return jd_id
+ 
+ 
+ def submit_modification_request(jd_id, section_name, clause_id, original_text, proposed_text, justification, *, actor_id):
+@@ -483,11 +521,14 @@
+             raise ValueError("تغير النص الحالي. يرجى إعادة تحميل البطاقة.")
+         if proposed_text.strip() == current.strip():
+             raise ValueError("النص المقترح مطابق للنص الحالي.")
++        state = governance.snapshot(conn, jd_id)
+         cur = conn.execute("""
+             INSERT INTO modification_requests
+-            (jd_id,section_name,clause_id,original_text,proposed_text,justification,requested_by,status)
+-            VALUES (?,?,?,?,?,?,?,'قيد الانتظار')
+-        """, (jd_id, section_name, str(clause_id), current, proposed_text, justification, actor['full_name']))
++            (jd_id,section_name,clause_id,original_text,proposed_text,justification,requested_by,status,
++             expected_version,expected_hash,requested_snapshot)
++            VALUES (?,?,?,?,?,?,?,'قيد الانتظار',?,?,?)
++        """, (jd_id, section_name, str(clause_id), current, proposed_text, justification, actor['full_name'],
++              state['card']['version'], governance.content_hash(state), governance.encode(state)))
+         return cur.lastrowid
+ 
+ 
+@@ -546,6 +587,10 @@
+         except ValueError as exc:
+             return False, str(exc)
+         status = decisions[decision]
++        before = governance.snapshot(conn, req['jd_id'])
++        if status == 'مقبول' and (req['expected_version'] != before['card']['version'] or
++                                  req['expected_hash'] != governance.content_hash(before)):
++            return False, 'تغير إصدار البطاقة أو محتواها منذ تقديم الطلب. يرجى تقديم طلب جديد.'
+         if status == 'مقبول' and current != (req['original_text'] or ""):
+             return False, "تغير النص منذ تقديم الطلب. يرجى إعادة المراجعة."
+         if status == 'مقبول' and not req['proposed_text'].strip():
+@@ -566,42 +611,81 @@
+                 """, (req['proposed_text'], target, req['jd_id'])).rowcount
+                 if changed != 1:
+                     raise ValueError("تعذر تحديث المسؤولية التابعة للبطاقة.")
+-                changed = conn.execute("""
+-                    UPDATE job_descriptions SET version=version+1,status='قيد المراجعة',updated_at=? WHERE id=?
+-                """, (now, req['jd_id'])).rowcount
+             else:
+                 changed = conn.execute(f"""
+-                    UPDATE job_descriptions SET {target}=?,version=version+1,status='قيد المراجعة',updated_at=? WHERE id=?
++                    UPDATE job_descriptions SET {target}=?,updated_at=? WHERE id=?
+                 """, (req['proposed_text'], now, req['jd_id'])).rowcount
+             if changed != 1:
+                 raise ValueError("تعذر تحديث البطاقة.")
++            governance.bind_review(conn, req['jd_id'])
+         action = "تم اعتماد التعديل" if status == 'مقبول' else "تم رفض التعديل"
+         conn.execute("""
+             INSERT INTO jd_audit_trail
+-            (jd_id,mod_request_id,section_name,action,old_text,new_text,changed_by,notes,changed_at)
+-            VALUES (?,?,?,?,?,?,?,?,?)
++            (jd_id,mod_request_id,section_name,action,old_text,new_text,changed_by,notes,changed_at,
++             actor_id,card_version,decision,snapshot_json,snapshot_hash,result_json,result_hash)
++            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         """, (req['jd_id'], request_id, req['section_name'], action, current, req['proposed_text'],
+-              actor['full_name'], f"actor_id={actor['id']}; طلب #{request_id}; {reviewer_comments}", now))
++              actor['full_name'], f"actor_id={actor['id']}; طلب #{request_id}; {reviewer_comments}", now,
++              *_evidence_values(actor, status, before, governance.snapshot(conn, req['jd_id']))))
+     return True, f"تمت معالجة الطلب بنجاح ({status})."
+ 
+ 
+-def approve_jd_as_is(jd_id, comments="", *, actor_id):
++def _evidence_values(actor, decision, before, after):
++    original, result = governance.encode(before), governance.encode(after)
++    return (actor['id'], before['card']['version'], decision, original, governance.digest(original),
++            result, governance.digest(result))
++
++
++def request_jd_review(jd_id, *, actor_id):
++    with _write_connection() as conn:
++        _require_actor(conn, actor_id, jd_id=jd_id)
++        card = conn.execute('SELECT * FROM job_descriptions WHERE id=?', (jd_id,)).fetchone()
++        state = governance.canonical_status(card['status'])
++        if state == 'معتمد':
++            raise ValueError('لا يمكن إعادة مراجعة بطاقة معتمدة دون تعديل المحتوى.')
++        if state == 'قيد المراجعة' and card['review_hash'] is not None:
++            raise ValueError('البطاقة قيد المراجعة بالفعل.')
++        conn.execute("UPDATE job_descriptions SET status='قيد المراجعة' WHERE id=?", (jd_id,))
++        governance.bind_review(conn, jd_id)
++
++
++def approve_jd_as_is(jd_id, comments="", *, actor_id, expected_version=None, expected_hash=None):
++    return decide_jd_review(jd_id, 'Approved', comments, actor_id=actor_id,
++                            expected_version=expected_version, expected_hash=expected_hash)
++
++
++def decide_jd_review(jd_id, decision, comments='', *, actor_id, expected_version=None, expected_hash=None):
++    target_status = governance.canonical_status(decision)
++    if target_status not in ('معتمد', 'مرفوض'):
++        raise ValueError('قرار المراجعة غير صالح.')
+     with _write_connection() as conn:
+         actor = _require_actor(conn, actor_id, jd_id=jd_id)
++        if target_status == 'مرفوض':
++            _require_actor(conn, actor_id, admin=True)
+         if conn.execute("SELECT 1 FROM modification_requests WHERE jd_id=? AND status IN ('Pending','قيد الانتظار')",
+                         (jd_id,)).fetchone():
+             raise ValueError("توجد طلبات تعديل معلقة. يرجى مراجعتها قبل الاعتماد.")
+-        card = conn.execute("SELECT version,status FROM job_descriptions WHERE id=?", (jd_id,)).fetchone()
+-        if card['status'] in ('Approved', 'معتمد'):
+-            return True
++        card = conn.execute("SELECT * FROM job_descriptions WHERE id=?", (jd_id,)).fetchone()
++        if governance.canonical_status(card['status']) != 'قيد المراجعة':
++            raise ValueError('لا يمكن اتخاذ القرار إلا لبطاقة قيد المراجعة.')
++        before = governance.snapshot(conn, jd_id)
++        fingerprint = governance.content_hash(before)
++        if (card['review_version'] != card['version'] or card['review_hash'] != fingerprint or
++                (expected_version is not None and expected_version != card['version']) or
++                (expected_hash is not None and expected_hash != fingerprint)):
++            raise ValueError('تغيرت البطاقة منذ طلب المراجعة. يرجى إعادة تحميلها وإرسالها للمراجعة.')
+         now = _utc_now()
+-        changed = conn.execute("UPDATE job_descriptions SET status='معتمد',updated_at=? WHERE id=?", (now, jd_id)).rowcount
++        changed = conn.execute("UPDATE job_descriptions SET status=?,updated_at=? WHERE id=?",
++                               (target_status, now, jd_id)).rowcount
+         if changed != 1:
+             raise ValueError("تعذر اعتماد البطاقة.")
+         conn.execute("""
+-            INSERT INTO jd_audit_trail (jd_id,section_name,action,new_text,changed_by,notes,changed_at)
+-            VALUES (?,'حالة الوثيقة','اعتماد نهائي دون تعديل','الحالة: معتمد',?,?,?)
+-        """, (jd_id, actor['full_name'], f"actor_id={actor['id']}; version={card['version']}; {comments}", now))
++            INSERT INTO jd_audit_trail (jd_id,section_name,action,new_text,changed_by,notes,changed_at,
++                actor_id,card_version,decision,snapshot_json,snapshot_hash,result_json,result_hash)
++            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
++        """, (jd_id, 'حالة الوثيقة', 'اعتماد نهائي دون تعديل' if target_status == 'معتمد' else 'رفض اعتماد البطاقة',
++              target_status, actor['full_name'], f"actor_id={actor['id']}; version={card['version']}; {comments}", now,
++              *_evidence_values(actor, target_status, before, governance.snapshot(conn, jd_id))))
+     return True
+ 
+ 
+@@ -628,6 +712,55 @@
+     return rows
+ 
+ 
++def get_decision_evidence(jd_id, *, _conn=None):
++    """Verify persisted bytes before exposing revision-bound evidence."""
++    import json
++    if _conn is None:
++        with closing(get_connection()) as conn:
++            return get_decision_evidence(jd_id, _conn=conn)
++    records = _conn.execute('SELECT * FROM jd_audit_trail WHERE jd_id=? AND snapshot_json IS NOT NULL ORDER BY id',
++                            (jd_id,)).fetchall()
++    result = []
++    for row in records:
++        row = dict(row)
++        for value, checksum in (('snapshot_json', 'snapshot_hash'), ('result_json', 'result_hash')):
++            if governance.digest(row[value]) != row[checksum]:
++                raise ValueError('فشل التحقق من سلامة سجل المراجعة.')
++            row[value] = json.loads(row[value])
++        result.append(row)
++    return result
++
++
++def get_approval_metadata(jd_id, *, _conn=None):
++    """Only a final approval of the current revision is electronic approval."""
++    if _conn is None:
++        with closing(get_connection()) as conn:
++            conn.execute('BEGIN')
++            return get_approval_metadata(jd_id, _conn=conn)
++    state = governance.snapshot(_conn, jd_id)
++    if governance.canonical_status(state['card']['status']) != 'معتمد':
++        return None
++    for record in reversed(get_decision_evidence(jd_id, _conn=_conn)):
++        if (record['mod_request_id'] is None and record['decision'] == 'معتمد' and
++                record['card_version'] == state['card']['version'] and
++                governance.content_hash(record['snapshot_json']) == governance.content_hash(state)):
++            return {'approver': record['changed_by'], 'actor_id': record['actor_id'],
++                    'decided_at': record['changed_at'], 'version': record['card_version'],
++                    'snapshot_hash': record['snapshot_hash'], 'evidence_id': record['id']}
++    return None
++
++
++def get_export_data(jd_id):
++    """Content and approval evidence from one consistent SQLite read transaction."""
++    with closing(get_connection()) as conn:
++        conn.execute('BEGIN')
++        state = governance.snapshot(conn, jd_id)
++        card = state['card']
++        card['status'] = governance.canonical_status(card['status'])
++        return (card, [r for r in state['accountabilities'] if r['is_active']],
++                get_approval_metadata(jd_id, _conn=conn))
++
++
+ def get_interview_schedule():
+     conn = get_connection()
+     cur = conn.cursor()
+@@ -637,13 +770,17 @@
+     return rows
+ 
+ 
+-def update_interview_status(item_id, status, notes="", *, actor_id):
++def update_interview_status(item_id, status=None, notes=None, *, actor_id, expected=None, clear_notes=False):
+     with _write_connection() as conn:
+         _require_actor(conn, actor_id, admin=True)
+-        changed = conn.execute("UPDATE interview_schedule SET status=?,notes=? WHERE id=?",
+-                               (status, notes, item_id)).rowcount
+-        if changed != 1:
++        current = conn.execute('SELECT * FROM interview_schedule WHERE id=?', (item_id,)).fetchone()
++        if not current:
+             raise ValueError("المقابلة غير موجودة.")
++        if expected is not None and any(current[k] != expected[k] for k in ('status', 'notes')):
++            raise ValueError('تغيرت بيانات المقابلة. يرجى إعادة تحميلها قبل الحفظ.')
++        new_status = status if isinstance(status, str) and status.strip() else current['status']
++        new_notes = '' if clear_notes else (notes if isinstance(notes, str) and notes.strip() else current['notes'])
++        conn.execute('UPDATE interview_schedule SET status=?,notes=? WHERE id=?', (new_status, new_notes, item_id))
+ 
+ 
+ def get_dashboard_stats():
+--- a/app.py
++++ b/app.py
+@@ -226,11 +226,11 @@
+                     col_meta3.markdown(f"**تاريخ تقديم الطلب:** {req['requested_at']}")
+ 
+                     st.markdown("---")
+-                    st.markdown("#### 🔍 المقارنة جنباً إلى جنب (النص الحالي المعتمد مقابل التعديل المقترح)")
++                    st.markdown("#### 🔍 المقارنة جنباً إلى جنب (النص وقت تقديم الطلب مقابل التعديل المقترح)")
+                     
+                     diff_col1, diff_col2 = st.columns(2)
+                     with diff_col1:
+-                        st.markdown("**النص المعتمد الحالي في البطاقة:**")
++                        st.markdown(f"**النص وقت تقديم الطلب — الإصدار {req['expected_version'] or 'غير موثق'}:**")
+                         st.markdown(f"""
+                         <div class="diff-box diff-old">
+                             {req['original_text'] or '<i>(البند فارغ أو مضاف حديثاً)</i>'}
+@@ -363,7 +363,7 @@
+         dept_list = ["كافة الإدارات"] + sorted(list({j['department'] for j in all_jds if j['department']}))
+         selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list)
+         
+-        status_list = ["كافة الحالات", "قيد المراجعة", "معتمد"]
++        status_list = ["كافة الحالات", "مسودة", "قيد المراجعة", "معتمد", "مرفوض"]
+         selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list)
+ 
+         filtered_jds = all_jds
+@@ -399,7 +399,7 @@
+                 """, unsafe_allow_html=True)
+ 
+             # Export Word Document Button in Arabic
+-            doc_stream = docx_parser.export_jd_to_docx(jd, accountabilities)
++            doc_stream = docx_parser.export_jd_to_docx(*database.get_export_data(jd['id']))
+             st.download_button(
+                 label=f"📥 تحميل بطاقة '{jd['title']}' كملف Word منسق (.docx)",
+                 data=doc_stream,
+@@ -412,7 +412,7 @@
+             sec1, sec2 = st.columns(2)
+             with sec1:
+                 st.markdown("""<div class="jd-section-card"><div class="jd-section-title">١. بيانات وبطاقة الوظيفة</div>""", unsafe_allow_html=True)
+-                st.write(f"- **كود الوظيفة:** {jd['job_code'] or '3S-JD-001'}")
++                st.write(f"- **كود الوظيفة:** {jd['job_code'] or 'غير مسجل'} | **معرف المنصة:** {jd['id']}")
+                 st.write(f"- **المسمى الوظيفي:** {jd['title']}")
+                 st.write(f"- **الإدارة التابع لها:** {jd['department'] or '—'}")
+                 st.write(f"- **المسؤول المباشر:** {jd['reports_to'] or '—'}")
+@@ -464,6 +464,11 @@
+                     <div style="white-space: pre-line;">{jd['qualifications']}</div>
+                 </div>
+                 """, unsafe_allow_html=True)
++
++            st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
++            st.write(jd['competencies'] or 'غير مسجلة')
++            st.markdown('#### بيانات الاعتماد الواردة في المصدر')
++            st.write(jd['approvals'] or 'غير مسجلة')
+ 
+             # Hazards & Relations
+             c_haz1, c_haz2 = st.columns(2)
+@@ -548,13 +553,25 @@
+             chosen_item_label = st.selectbox("اختر المقابلة / الإدارة المستهدفة", list(item_options.keys()))
+             chosen_id = item_options[chosen_item_label]
+             selected_interview = next(it for it in schedule_items if it['id'] == chosen_id)
++            base_key = f'interview_base_{chosen_id}'
++            if st.button('إعادة تحميل بيانات المقابلة'):
++                st.session_state.pop(base_key, None)
++                st.session_state.pop(f'interview_status_{chosen_id}', None)
++                st.session_state.pop(f'interview_notes_{chosen_id}', None)
++                st.rerun()
++            interview_base = st.session_state.setdefault(base_key, {
++                'status': selected_interview['status'], 'notes': selected_interview['notes']})
+             statuses = list(dict.fromkeys([selected_interview['status'], "قيد المراجعة", "مكتملة", "مؤجلة", "لم تبدأ"]))
+             with st.form(f"update_interview_form_{chosen_id}"):
+-                new_status = st.selectbox("حالة المقابلة الحالية", statuses)
+-                interview_notes = st.text_area("الملاحظات ومخرجات الاجتماع المتفق عليها", value=selected_interview['notes'] or "")
++                new_status = st.selectbox("حالة المقابلة الحالية", statuses, key=f'interview_status_{chosen_id}')
++                interview_notes = st.text_area("الملاحظات ومخرجات الاجتماع المتفق عليها", value=selected_interview['notes'] or "", key=f'interview_notes_{chosen_id}')
+                 save_interview = st.form_submit_button("حفظ وتحديث حالة المقابلة", type="primary")
+                 if save_interview:
+-                    _run_write(database.update_interview_status, chosen_id, new_status, interview_notes, actor_id=user['id'])
++                    _run_write(database.update_interview_status, chosen_id,
++                               new_status if new_status != interview_base['status'] else None,
++                               interview_notes if interview_notes != (interview_base['notes'] or '') else None,
++                               actor_id=user['id'], expected=interview_base)
++                    st.session_state.pop(base_key, None)
+                     st.success("تم تحديث حالة المقابلة وتوثيق المخرجات بنجاح!")
+                     st.rerun()
+ 
+@@ -617,8 +634,21 @@
+             with st.expander("✅ الخيار الأول: اعتماد بطاقة الوصف الوظيفي كما هي", expanded=(jd['status'] != 'معتمد')):
+                 st.markdown("في حال كانت كافة المهام والمسؤوليات والصلاحيات والمؤهلات مطابقة تماماً لطبيعة عملكم، يرجى تأكيد الاعتماد النهائي للبطاقة.")
+                 appr_notes = st.text_input("ملاحظات الاعتماد والتوقيع (اختياري)", placeholder="مثال: تمت المراجعة والاتفاق في اجتماع مراجعة الوصف الوظيفي.")
+-                if st.button("تأكيد الاعتماد والموافقة النهائية", type="primary", use_container_width=True, disabled=not can_write_card):
+-                    _run_write(database.approve_jd_as_is, current_jd_id, actor_id=user['id'], comments=appr_notes)
++                approval_key = f'approval_base_{current_jd_id}'
++                approval_base = st.session_state.setdefault(approval_key, {
++                    'expected_version': jd['version'], 'expected_hash': jd['review_hash']})
++                if jd['status'] in ('مسودة', 'مرفوض') or (jd['status'] == 'قيد المراجعة' and not jd['review_hash']):
++                    if st.button('إرسال الإصدار الحالي للمراجعة', disabled=not can_write_card):
++                        _run_write(database.request_jd_review, current_jd_id, actor_id=user['id'])
++                        st.session_state.pop(approval_key, None)
++                        st.rerun()
++                if st.button('إعادة تحميل بيانات المراجعة'):
++                    st.session_state.pop(approval_key, None)
++                    st.rerun()
++                if st.button("تأكيد الاعتماد والموافقة النهائية", type="primary", use_container_width=True,
++                             disabled=not can_write_card or jd['status'] != 'قيد المراجعة' or not jd['review_hash']):
++                    _run_write(database.approve_jd_as_is, current_jd_id, actor_id=user['id'], comments=appr_notes, **approval_base)
++                    st.session_state.pop(approval_key, None)
+                     st.success("🎉 تم اعتماد بطاقة الوصف الوظيفي رسمياً بنجاح وتوثيق ذلك في سجل النظام!")
+                     st.rerun()
+ 
+@@ -744,6 +774,11 @@
+             </div>
+             """, unsafe_allow_html=True)
+ 
++        st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
++        st.write(jd['competencies'] or 'غير مسجلة')
++        st.markdown('#### بيانات الاعتماد الواردة في المصدر')
++        st.write(jd['approvals'] or 'غير مسجلة')
++
+         hz_c1, hz_c2 = st.columns(2)
+         with hz_c1:
+             st.markdown(f"""
+@@ -804,7 +839,7 @@
+     with tab_export:
+         st.subheader("📥 تنزيل وطباعة بطاقة الوصف الوظيفي المعتمدة")
+         st.markdown("يمكنك تنزيل نسخة رسمية منسقة بملف Word (.docx) باللغة العربية وتحتوي على كافة الجداول ومربعات التوقيع الرسمية.")
+-        doc_stream = docx_parser.export_jd_to_docx(jd, accountabilities)
++        doc_stream = docx_parser.export_jd_to_docx(*database.get_export_data(jd['id']))
+         st.download_button(
+             label=f"📥 تنزيل بطاقة '{jd['title']}' كملف Word (.docx)",
+             data=doc_stream,
+--- a/docx_parser.py
++++ b/docx_parser.py
+@@ -11,6 +11,7 @@
+ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+ from docx.oxml import OxmlElement, parse_xml
+ from docx.oxml.ns import nsdecls, qn
++from docx_format import parse_system_document
+ 
+ 
+ def set_cell_background(cell, fill_hex):
+@@ -41,6 +42,10 @@
+         file_source.seek(0)
+         doc = docx.Document(file_source)
+         file_name = getattr(file_source, 'name', 'uploaded_document.docx')
++
++    system_document = parse_system_document(doc, file_name)
++    if system_document is not None:
++        return system_document
+ 
+     res = {
+         'file_name': file_name,
+@@ -129,14 +134,24 @@
+                 res['frameworks'] = table.rows[1].cells[0].text.strip()
+ 
+         # 6. QUALIFICATIONS & SKILLS
+-        elif any(k in header_text for k in ['QUALIFICATION', 'المؤهلات', 'الخبرات', 'المهارات', 'EXPERIENCE']):
++        elif not any(k in header_text for k in ['COMPETENC', 'الجدارات', 'الكفاءات']) and any(k in header_text for k in ['QUALIFICATION', 'المؤهلات', 'الخبرات', 'المهارات', 'EXPERIENCE']):
+             if len(table.rows) > 1:
+                 res['qualifications'] = table.rows[1].cells[0].text.strip()
+ 
+         # 7. COMPETENCIES
+         elif any(k in header_text for k in ['COMPETENC', 'الجدارات', 'الكفاءات']):
+-            if len(table.rows) > 1:
+-                res['competencies'] = table.rows[1].cells[0].text.strip()
++            lines = []
++            for row in table.rows[1:]:
++                seen_cells = set()
++                values = []
++                for cell in row.cells:
++                    if cell._tc not in seen_cells:
++                        seen_cells.add(cell._tc)
++                        if cell.text.strip():
++                            values.append(cell.text.strip())
++                if values:
++                    lines.append(' | '.join(values))
++            res['competencies'] = '\n'.join(lines)
+ 
+         # 8. JOB HAZARDS & SAFE PRACTICES
+         elif any(k in header_text for k in ['HAZAARD', 'HAZARD', 'مخاطر', 'السلامة']):
+@@ -168,177 +183,5 @@
+     return res
+ 
+ 
+-def export_jd_to_docx(jd_data, accountabilities):
+-    """
+-    Exports a structured JD into a professional Arabic RTL Word document (.docx).
+-    """
+-    doc = docx.Document()
+-
+-    # Document Header Title
+-    title_p = doc.add_paragraph()
+-    set_p_rtl(title_p)
+-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+-    run = title_p.add_run("شركة ثري إس للأنظمة الأمنية (3S Security Systems)\nبطاقة الوصف والتوصيف الوظيفي المعتمدة")
+-    run.font.name = "Arial"
+-    run.font.size = Pt(16)
+-    run.font.bold = True
+-    run.font.color.rgb = RGBColor(15, 43, 72)
+-
+-    # 1. Job Profile Details Table
+-    h1 = doc.add_heading("١. بيانات وبطاقة الوظيفة", level=2)
+-    set_p_rtl(h1)
+-
+-    tbl_profile = doc.add_table(rows=5, cols=2)
+-    tbl_profile.alignment = WD_TABLE_ALIGNMENT.CENTER
+-    tbl_profile.style = 'Table Grid'
+-
+-    profile_data = [
+-        ("كود الوظيفة:", jd_data.get('job_code', '') or '3S-JD-001'),
+-        ("المسمى الوظيفي:", jd_data.get('title', '')),
+-        ("الإدارة التابع لها:", jd_data.get('department', '') or 'الإدارة العامة'),
+-        ("القطاع:", jd_data.get('sector', '') or 'الإدارة العامة والمجموعة'),
+-        ("المسؤول المباشر:", jd_data.get('reports_to', '') or 'الإدارة العليا')
+-    ]
+-
+-    for i, (k, v) in enumerate(profile_data):
+-        cell_k = tbl_profile.rows[i].cells[0]
+-        cell_v = tbl_profile.rows[i].cells[1]
+-        cell_k.text = k
+-        cell_v.text = v or "—"
+-        set_cell_background(cell_k, "F0F4F8")
+-        set_p_rtl(cell_k.paragraphs[0])
+-        set_p_rtl(cell_v.paragraphs[0])
+-        cell_k.paragraphs[0].runs[0].font.bold = True
+-        cell_k.paragraphs[0].runs[0].font.name = "Arial"
+-        cell_v.paragraphs[0].runs[0].font.name = "Arial"
+-
+-    # 2. Purpose
+-    h2 = doc.add_heading("٢. الهدف العام من الوظيفة", level=2)
+-    set_p_rtl(h2)
+-    p_purpose = doc.add_paragraph(jd_data.get('purpose', '') or "لم يتم تحديد وصف الهدف العام بعد.")
+-    set_p_rtl(p_purpose)
+-
+-    # 3. Dimensions
+-    if jd_data.get('dimensions'):
+-        h3 = doc.add_heading("٣. أبعاد الوظيفة والنطاق الإشرافي", level=2)
+-        set_p_rtl(h3)
+-        p_dim = doc.add_paragraph(jd_data.get('dimensions', ''))
+-        set_p_rtl(p_dim)
+-
+-    # 4. Key Accountabilities
+-    h4 = doc.add_heading("٤. المسؤوليات والواجبات الرئيسية ومؤشرات قياس الأداء (KPIs)", level=2)
+-    set_p_rtl(h4)
+-
+-    if accountabilities:
+-        tbl_acc = doc.add_table(rows=len(accountabilities) + 1, cols=3)
+-        tbl_acc.alignment = WD_TABLE_ALIGNMENT.CENTER
+-        tbl_acc.style = 'Table Grid'
+-
+-        # Headers
+-        h_seq = tbl_acc.rows[0].cells[0]
+-        h_desc = tbl_acc.rows[0].cells[1]
+-        h_kpi = tbl_acc.rows[0].cells[2]
+-
+-        h_seq.text = "م"
+-        h_desc.text = "بيان المسؤولية والواجب الوظيفي"
+-        h_kpi.text = "مؤشر قياس الأداء (KPI)"
+-
+-        for h in [h_seq, h_desc, h_kpi]:
+-            set_cell_background(h, "1A365D")
+-            set_p_rtl(h.paragraphs[0])
+-            h.paragraphs[0].runs[0].font.color.rgb = RGBColor(255, 255, 255)
+-            h.paragraphs[0].runs[0].font.bold = True
+-            h.paragraphs[0].runs[0].font.name = "Arial"
+-
+-        for idx, acc in enumerate(accountabilities):
+-            row = tbl_acc.rows[idx + 1]
+-            row.cells[0].text = str(acc.get('item_order', idx + 1))
+-            row.cells[1].text = acc.get('description', '')
+-            row.cells[2].text = acc.get('kpi', '') or "—"
+-            
+-            for c in row.cells:
+-                set_p_rtl(c.paragraphs[0])
+-                c.paragraphs[0].runs[0].font.name = "Arial"
+-
+-            if idx % 2 == 1:
+-                set_cell_background(row.cells[0], "F9FAFB")
+-                set_cell_background(row.cells[1], "F9FAFB")
+-                set_cell_background(row.cells[2], "F9FAFB")
+-
+-    # 5. Frameworks & Authority
+-    if jd_data.get('frameworks'):
+-        h5 = doc.add_heading("٥. إطار العمل وحدود اتخاذ القرارات والصلاحيات", level=2)
+-        set_p_rtl(h5)
+-        p_fw = doc.add_paragraph(jd_data.get('frameworks', ''))
+-        set_p_rtl(p_fw)
+-
+-    # 6. Qualifications & Skills
+-    if jd_data.get('qualifications'):
+-        h6 = doc.add_heading("٦. المؤهلات العلمية والخبرات والمهارات المطلوبة", level=2)
+-        set_p_rtl(h6)
+-        p_qual = doc.add_paragraph(jd_data.get('qualifications', ''))
+-        set_p_rtl(p_qual)
+-
+-    # 7. Hazards & Safe Practices
+-    h7 = doc.add_heading("٧. مخاطر الوظيفة وممارسات السلامة والصحة المهنية", level=2)
+-    set_p_rtl(h7)
+-    tbl_haz = doc.add_table(rows=2, cols=2)
+-    tbl_haz.style = 'Table Grid'
+-    tbl_haz.rows[0].cells[0].text = "مخاطر الوظيفة وبيئة العمل"
+-    tbl_haz.rows[0].cells[1].text = "ممارسات وإجراءات السلامة المتبعة"
+-    set_cell_background(tbl_haz.rows[0].cells[0], "F0F4F8")
+-    set_cell_background(tbl_haz.rows[0].cells[1], "F0F4F8")
+-    set_p_rtl(tbl_haz.rows[0].cells[0].paragraphs[0])
+-    set_p_rtl(tbl_haz.rows[0].cells[1].paragraphs[0])
+-
+-    tbl_haz.rows[1].cells[0].text = jd_data.get('hazards', '') or "بيئة مكتبية اعتيادية ومخاطر استخدام الحاسب الآلي."
+-    tbl_haz.rows[1].cells[1].text = jd_data.get('safe_practices', '') or "توفير التجهيزات المكتبية المناسبة والالتزام بإرشادات السلامة."
+-    set_p_rtl(tbl_haz.rows[1].cells[0].paragraphs[0])
+-    set_p_rtl(tbl_haz.rows[1].cells[1].paragraphs[0])
+-
+-    # 8. Internal & External Relations
+-    h8 = doc.add_heading("٨. شبكة العلاقات والاتصال الوظيفي", level=2)
+-    set_p_rtl(h8)
+-    tbl_rel = doc.add_table(rows=2, cols=2)
+-    tbl_rel.style = 'Table Grid'
+-    tbl_rel.rows[0].cells[0].text = "العلاقات والاتصالات الداخلية"
+-    tbl_rel.rows[0].cells[1].text = "العلاقات والاتصالات الخارجية"
+-    set_cell_background(tbl_rel.rows[0].cells[0], "F0F4F8")
+-    set_cell_background(tbl_rel.rows[0].cells[1], "F0F4F8")
+-    set_p_rtl(tbl_rel.rows[0].cells[0].paragraphs[0])
+-    set_p_rtl(tbl_rel.rows[0].cells[1].paragraphs[0])
+-
+-    tbl_rel.rows[1].cells[0].text = jd_data.get('internal_relations', '') or "كافة إدارات وأقسام الشركة المعنية."
+-    tbl_rel.rows[1].cells[1].text = jd_data.get('external_relations', '') or "العملاء، الموردين، والجهات الحكومية والرقابية."
+-    set_p_rtl(tbl_rel.rows[1].cells[0].paragraphs[0])
+-    set_p_rtl(tbl_rel.rows[1].cells[1].paragraphs[0])
+-
+-    # 9. Signatures / Status
+-    h9 = doc.add_heading("٩. محضر الاعتماد والتوقيعات", level=2)
+-    set_p_rtl(h9)
+-    tbl_appr = doc.add_table(rows=2, cols=3)
+-    tbl_appr.style = 'Table Grid'
+-    tbl_appr.rows[0].cells[0].text = "شاغل الوظيفة / المدير المسؤول"
+-    tbl_appr.rows[0].cells[1].text = "مدير إدارة الموارد البشرية"
+-    tbl_appr.rows[0].cells[2].text = "العضو المنتدب والمدير التنفيذي"
+-    for c in tbl_appr.rows[0].cells:
+-        set_cell_background(c, "F0F4F8")
+-        set_p_rtl(c.paragraphs[0])
+-        c.paragraphs[0].runs[0].font.bold = True
+-    tbl_appr.rows[1].cells[0].text = "التوقيع: ............................\nالتاريخ:    /    / 2027"
+-    tbl_appr.rows[1].cells[1].text = "التوقيع: ............................\nالتاريخ:    /    / 2027"
+-    tbl_appr.rows[1].cells[2].text = "التوقيع: ............................\nالتاريخ:    /    / 2027"
+-    for c in tbl_appr.rows[1].cells:
+-        set_p_rtl(c.paragraphs[0])
+-
+-    # Footer
+-    p_status = doc.add_paragraph(
+-        f"حالة الوثيقة: {jd_data.get('status', 'قيد المراجعة')} | الإصدار: {jd_data.get('version', 1)} | صدرت إلكترونياً عبر منصة ثري إس للأنظمة الأمنية 2027"
+-    )
+-    set_p_rtl(p_status)
+-    p_status.paragraph_format.space_before = Pt(14)
+-
+-    target_stream = io.BytesIO()
+-    doc.save(target_stream)
+-    target_stream.seek(0)
+-    return target_stream
++# One explicit format contract for all newly exported documents.
++from docx_format import export_jd_to_docx
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -4,6 +4,7 @@
+ 
+ import pytest
+ import database
++import governance
+ 
+ 
+ @pytest.fixture
+@@ -21,6 +22,8 @@
+                                            (3, "staff", "employee", 1), (4, "other", "manager", 2)):
+             conn.execute("INSERT INTO users(id,username,password,full_name,role,assigned_jd_id) VALUES (?,?,?,?,?,?)",
+                          (uid, name, "synthetic-secret", f"مستخدم {uid}", role, assigned))
++        conn.row_factory = sqlite3.Row
++        governance.migrate(conn)
+     return path
+ 
+ 
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,6 +7,7 @@
+ *.sqlite*
+ data/backups/
+ _stage1_work/
++_stage2_work/
+ .env
+ .streamlit/secrets.toml
+ job describation/
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -9,6 +9,7 @@
+ .vscode
+ .venv
+ _stage1_work
++_stage2_work
+ data
+ *.db
+ *.db-*
+--- /dev/null
++++ b/governance.py
+@@ -0,0 +1,126 @@
++"""Revision-bound SQLite governance; additive migration preserves legacy values."""
++import hashlib
++import json
++
++CONTENT_FIELDS = (
++    'job_code', 'title', 'department', 'sector', 'reports_to', 'purpose',
++    'dimensions', 'frameworks', 'qualifications', 'competencies', 'hazards',
++    'safe_practices', 'internal_relations', 'external_relations', 'approvals',
++    'source_file',
++)
++STATUS_ALIASES = {
++    'Draft': 'مسودة', 'مسودة': 'مسودة',
++    'Under Review': 'قيد المراجعة', 'Pending Review': 'قيد المراجعة',
++    'قيد المراجعة': 'قيد المراجعة',
++    'Approved': 'معتمد', 'معتمد': 'معتمد',
++    'Rejected': 'مرفوض', 'مرفوض': 'مرفوض',
++}
++
++
++def canonical_status(value):
++    if value not in STATUS_ALIASES:
++        raise ValueError('حالة الوثيقة غير صالحة.')
++    return STATUS_ALIASES[value]
++
++
++def encode(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
++
++
++def digest(value):
++    return hashlib.sha256(value.encode('utf-8')).hexdigest()
++
++
++def snapshot(conn, jd_id):
++    card = dict(conn.execute('SELECT * FROM job_descriptions WHERE id=?', (jd_id,)).fetchone())
++    # Workflow evidence is excluded from the content fingerprint.
++    card = {k: card[k] for k in ('id', *CONTENT_FIELDS, 'version', 'status')}
++    rows = [dict(r) for r in conn.execute(
++        'SELECT * FROM accountabilities WHERE jd_id=? ORDER BY item_order,id', (jd_id,))]
++    return {'card': card, 'accountabilities': rows}
++
++
++def content_hash(state):
++    card = {k: v for k, v in state['card'].items() if k not in ('status', 'version')}
++    return digest(encode({'card': card, 'accountabilities': state['accountabilities']}))
++
++
++def bind_review(conn, jd_id):
++    state = snapshot(conn, jd_id)
++    conn.execute('UPDATE job_descriptions SET review_version=?,review_hash=? WHERE id=?',
++                 (state['card']['version'], content_hash(state), jd_id))
++
++
++def migrate(conn):
++    """Run inside a transaction, after the startup backup and base schema creation.
++
++    No business value or historical evidence is rewritten. Legacy pending requests
++    have no provable base revision and must be rejected/resubmitted to be accepted.
++    """
++    additions = {
++        'job_descriptions': {'review_version': 'INTEGER', 'review_hash': 'TEXT', 'import_hash': 'TEXT'},
++        'modification_requests': {
++            'expected_version': 'INTEGER', 'expected_hash': 'TEXT', 'requested_snapshot': 'TEXT',
++        },
++        'jd_audit_trail': {
++            'actor_id': 'INTEGER', 'card_version': 'INTEGER', 'decision': 'TEXT',
++            'snapshot_json': 'TEXT', 'snapshot_hash': 'TEXT',
++            'result_json': 'TEXT', 'result_hash': 'TEXT',
++        },
++    }
++    new_review_columns = False
++    for table, columns in additions.items():
++        existing = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
++        for name, kind in columns.items():
++            if name not in existing:
++                conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {kind}')
++                new_review_columns |= table == 'job_descriptions' and name == 'review_hash'
++
++    def trigger(name, timing, body):
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {name} {timing} BEGIN {body} END')
++
++    dirty = ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in CONTENT_FIELDS)
++    trigger('stage2_card_revision',
++            f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions WHEN {dirty}',
++            "UPDATE job_descriptions SET version=OLD.version+1,status='قيد المراجعة',"
++            "review_version=NULL,review_hash=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=NEW.id;")
++    trigger('stage2_version_guard', 'BEFORE UPDATE OF version ON job_descriptions WHEN NEW.version < OLD.version',
++            "SELECT RAISE(ABORT,'Revision cannot decrease');")
++    for event, ref, condition in (
++        ('INSERT', 'NEW', ''), ('DELETE', 'OLD', ''),
++        ('UPDATE', 'NEW', ' WHEN ' + ' OR '.join(
++            f'NEW.{f} IS NOT OLD.{f}' for f in ('description', 'kpi', 'item_order', 'is_active'))),
++    ):
++        trigger(f'stage2_child_{event.lower()}', f'AFTER {event} ON accountabilities{condition}',
++                "UPDATE job_descriptions SET version=version+1,status='قيد المراجعة',review_version=NULL,review_hash=NULL,"
++                f"updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id={ref}.jd_id;")
++    trigger('stage2_child_parent_lock', 'BEFORE UPDATE OF jd_id ON accountabilities WHEN NEW.jd_id IS NOT OLD.jd_id',
++            "SELECT RAISE(ABORT,'Responsibility parent is immutable');")
++    # Keep legacy aliases readable, while all service transitions write Arabic.
++    case = 'CASE {ref}.status ' + ' '.join(
++        f"WHEN '{alias}' THEN '{status}'" for alias, status in STATUS_ALIASES.items()) + ' END'
++    old, new = case.format(ref='OLD'), case.format(ref='NEW')
++    valid = (f"({old}={new}) OR ({old}='مسودة' AND {new}='قيد المراجعة') OR "
++             f"({old}='قيد المراجعة' AND {new} IN ('معتمد','مرفوض')) OR "
++             f"({old}='مرفوض' AND {new}='قيد المراجعة') OR "
++             f"({old}='معتمد' AND {new}='قيد المراجعة' AND NEW.version>OLD.version)")
++    trigger('stage2_status_guard', f'BEFORE UPDATE OF status ON job_descriptions WHEN ({new}) IS NULL OR NOT ({valid})',
++            "SELECT RAISE(ABORT,'Invalid document state transition');")
++    for operation in ('UPDATE', 'DELETE'):
++        trigger(f'stage2_audit_no_{operation.lower()}', f'BEFORE {operation} ON jd_audit_trail',
++                "SELECT RAISE(ABORT,'Audit evidence is immutable');")
++        trigger(f'stage2_request_no_{operation.lower()}',
++                f"BEFORE {operation} ON modification_requests WHEN OLD.status NOT IN ('Pending','قيد الانتظار')",
++                "SELECT RAISE(ABORT,'Review decision is immutable');")
++    base_fields = ('jd_id', 'section_name', 'clause_id', 'original_text', 'proposed_text',
++                   'justification', 'requested_by', 'requested_at', 'expected_version', 'expected_hash', 'requested_snapshot')
++    trigger('stage2_request_base_lock', 'BEFORE UPDATE ON modification_requests WHEN ' +
++            ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in base_fields),
++            "SELECT RAISE(ABORT,'Review request base is immutable');")
++    trigger('stage2_request_status_guard',
++            "BEFORE UPDATE OF status ON modification_requests WHEN NEW.status NOT IN ('مقبول','مرفوض')",
++            "SELECT RAISE(ABORT,'Invalid review decision');")
++    if new_review_columns:
++        for row in conn.execute('SELECT id,status FROM job_descriptions').fetchall():
++            if STATUS_ALIASES.get(row['status']) == 'قيد المراجعة':
++                bind_review(conn, row['id'])
+--- /dev/null
++++ b/docx_format.py
+@@ -0,0 +1,221 @@
++"""Editable Word interchange v2: visible text is the source of truth, not hidden JSON."""
++import io
++import re
++
++import docx
++from docx.shared import Inches, Pt, RGBColor
++from docx.enum.text import WD_ALIGN_PARAGRAPH
++from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
++from docx.oxml import OxmlElement
++from docx.oxml.ns import qn
++
++FORMAT = '3S-JD/v2'
++PROFILE = (
++    ('job_code', 'كود الوظيفة'), ('title', 'المسمى الوظيفي'),
++    ('department', 'الإدارة'), ('sector', 'القطاع'), ('reports_to', 'المسؤول المباشر'),
++)
++SECTIONS = (
++    ('purpose', 'الهدف العام من الوظيفة'), ('dimensions', 'أبعاد الوظيفة والنطاق الإشرافي'),
++    ('frameworks', 'إطار العمل وحدود اتخاذ القرارات'),
++    ('qualifications', 'المؤهلات والخبرات والمهارات'),
++    ('competencies', 'الجدارات والكفاءات والمعايير السلوكية والفنية'),
++    ('hazards', 'مخاطر الوظيفة'), ('safe_practices', 'ممارسات السلامة والصحة المهنية'),
++    ('internal_relations', 'العلاقات الداخلية'), ('external_relations', 'العلاقات الخارجية'),
++    ('approvals', 'بيانات الاعتماد الواردة في المصدر'),
++)
++
++
++def rtl(paragraph):
++    prop = paragraph._p.get_or_add_pPr()
++    if prop.find(qn('w:bidi')) is None:
++        prop.append(OxmlElement('w:bidi'))
++    # Logical start aligns Arabic to the leading (right) edge in modern Word.
++    prop.get_or_add_jc().set(qn('w:val'), 'start')
++    for run in paragraph.runs:
++        run.font.name = 'Arial'
++        run.font.rtl = True
++        run._element.get_or_add_rPr().get_or_add_rFonts().set(qn('w:cs'), 'Arial')
++
++
++def field(paragraph, key, value, number):
++    paragraph.text = '' if value is None else str(value)
++    start = OxmlElement('w:bookmarkStart')
++    start.set(qn('w:id'), str(number))
++    start.set(qn('w:name'), 's3jd2_' + key)
++    paragraph._p.insert(0, start)
++    end = OxmlElement('w:bookmarkEnd')
++    end.set(qn('w:id'), str(number))
++    paragraph._p.append(end)
++    rtl(paragraph)
++
++
++def table(doc, headers, widths, caption):
++    result = doc.add_table(rows=1, cols=len(headers))
++    result.style = 'Table Grid'
++    result.alignment = WD_TABLE_ALIGNMENT.CENTER
++    result.autofit = False
++    prop = result._tbl.tblPr
++    prop.append(OxmlElement('w:bidiVisual'))
++    label = OxmlElement('w:tblCaption')
++    label.set(qn('w:val'), caption)
++    prop.append(label)
++    borders = OxmlElement('w:tblBorders')
++    for edge in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
++        item = OxmlElement('w:' + edge)
++        for k, v in (('val', 'single'), ('sz', '4'), ('color', 'D9D9D9')):
++            item.set(qn('w:' + k), v)
++        borders.append(item)
++    prop.append(borders)
++    for column, width in zip(result.columns, widths):
++        column.width = Inches(width)
++    total = prop.find(qn('w:tblW'))
++    total.set(qn('w:type'), 'dxa')
++    total.set(qn('w:w'), str(round(sum(widths) * 1440)))
++    for cell, text in zip(result.rows[0].cells, headers):
++        cell.text = text
++        shade = OxmlElement('w:shd')
++        shade.set(qn('w:fill'), '1A365D')
++        cell._tc.get_or_add_tcPr().append(shade)
++        for run in cell.paragraphs[0].runs:
++            run.font.color.rgb = RGBColor(255, 255, 255)
++            run.bold = True
++    repeat = OxmlElement('w:tblHeader')
++    result.rows[0]._tr.get_or_add_trPr().append(repeat)
++    return result
++
++
++def competency_criteria(text):
++    criteria = {'behavioral': [], 'technical': [], 'other': []}
++    for line in (text or '').splitlines():
++        group = 'other'
++        if re.search(r'سلوك|behavior', line, re.I):
++            group = 'behavioral'
++        elif re.search(r'فني|فنية|تقني|technical', line, re.I):
++            group = 'technical'
++        criteria[group].append(line)
++    return criteria
++
++
++def parse_system_document(doc, file_name):
++    identifier = doc.core_properties.identifier or ''
++    if not identifier.startswith('3S-JD/'):
++        if any(b.get(qn('w:name'), '').startswith('s3jd2_')
++               for b in doc.element.body.iter(qn('w:bookmarkStart'))):
++            raise ValueError('معرف قالب Word مفقود. أعد تصدير الوثيقة من المنصة.')
++        return None
++    if identifier != FORMAT:
++        raise ValueError('إصدار قالب Word غير مدعوم.')
++    fields = {}
++    # Bookmarks identify editable visible paragraphs, including paragraphs in cells.
++    for paragraph in doc.element.body.iter(qn('w:p')):
++        for bookmark in paragraph.iter(qn('w:bookmarkStart')):
++            name = bookmark.get(qn('w:name'), '')
++            if name.startswith('s3jd2_'):
++                key = name[6:]
++                if key in fields:
++                    raise ValueError('تكرار حقل في قالب Word.')
++                fields[key] = docx.text.paragraph.Paragraph(paragraph, doc).text
++    required = {k for k, _ in (*PROFILE, *SECTIONS)} | {'portal_card_id', 'version', 'status'}
++    if not required.issubset(fields):
++        raise ValueError('قالب Word غير مكتمل. أعد التصدير مع الحفاظ على أقسام الوثيقة.')
++    tables = [t for t in doc.tables if t._tbl.tblPr.find(qn('w:tblCaption')) is not None and
++              t._tbl.tblPr.find(qn('w:tblCaption')).get(qn('w:val')) == '3SJD2:accountabilities']
++    if len(tables) != 1:
++        raise ValueError('جدول المسؤوليات مفقود أو مكرر.')
++    responsibilities = []
++    for row in tables[0].rows[1:]:
++        if len(row.cells) != 3:
++            raise ValueError('تنسيق جدول المسؤوليات غير صالح.')
++        order, description, kpi = (c.text for c in row.cells)
++        if not order.isdigit():
++            raise ValueError('ترتيب المسؤولية غير صالح.')
++        responsibilities.append({'item_order': int(order), 'description': description, 'kpi': kpi})
++    try:
++        fields['portal_card_id'] = int(fields['portal_card_id']) if fields['portal_card_id'] else None
++        fields['version'] = int(fields['version'])
++    except ValueError as exc:
++        raise ValueError('معرف البطاقة أو إصدارها غير صالح.') from exc
++    fields.update(file_name=file_name, format_version=2, accountabilities=responsibilities,
++                  competency_criteria=competency_criteria(fields['competencies']))
++    return fields
++
++
++def export_jd_to_docx(jd_data, accountabilities, approval_metadata=None):
++    doc = docx.Document()
++    doc.core_properties.identifier = FORMAT
++    section = doc.sections[0]
++    section.left_margin = section.right_margin = Inches(.7)
++    section.page_width, section.page_height = Inches(8.27), Inches(11.69)
++    style = doc.styles['Normal']
++    style.font.name, style.font.size = 'Arial', Pt(11)
++    style.paragraph_format.space_after = Pt(6)
++    for name in ('Title', 'Heading 1', 'Heading 2'):
++        doc.styles[name].font.color.rgb = RGBColor(0, 0, 0)
++    for style in doc.styles:
++        if style.type == 1:
++            prop = style.element.find(qn('w:pPr'))
++            if prop is not None:
++                for border in list(prop.findall(qn('w:pBdr'))):
++                    prop.remove(border)
++    title = doc.add_paragraph('شركة ثري إس للأنظمة الأمنية\nبطاقة الوصف الوظيفي', 'Title')
++    rtl(title)
++    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
++    intro = doc.add_paragraph('توضح هذه البطاقة نطاق الوظيفة ومسؤولياتها ومعاييرها. '
++                              'الحقول الفارغة غير مسجلة. بيانات اعتماد المصدر لا تثبت اعتماد الإصدار الحالي.')
++    rtl(intro)
++    number = 0
++
++    def put(p, key, value):
++        nonlocal number
++        number += 1
++        field(p, key, value, number)
++
++    profile = table(doc, ('بيانات الوظيفة والحوكمة', 'القيمة المسجلة'), (2.2, 4.6), '3SJD2:profile')
++    for key, label in (*PROFILE, ('portal_card_id', 'معرف البطاقة في المنصة'),
++                       ('version', 'الإصدار'), ('status', 'حالة الوثيقة')):
++        cells = profile.add_row().cells
++        cells[0].text = label
++        put(cells[1].paragraphs[0], key, jd_data.get('id') if key == 'portal_card_id' else jd_data.get(key, ''))
++    for key, heading in SECTIONS:
++        rtl(doc.add_heading(heading, 2))
++        put(doc.add_paragraph(), key, jd_data.get(key, ''))
++        if key == 'dimensions':
++            rtl(doc.add_heading('المسؤوليات ومؤشرات قياس الأداء', 2))
++            acc_table = table(doc, ('م', 'بيان المسؤولية والواجب الوظيفي', 'مؤشر قياس الأداء'),
++                              (.4, 4.3, 2.1), '3SJD2:accountabilities')
++            for index, acc in enumerate(accountabilities, 1):
++                cells = acc_table.add_row().cells
++                for cell, value in zip(cells, (acc.get('item_order', index), acc.get('description', ''), acc.get('kpi') or '')):
++                    cell.text = str(value)
++    rtl(doc.add_heading('قرار اعتماد الإصدار الحالي', 2))
++    if approval_metadata:
++        evidence = table(doc, ('بيانات القرار', 'القيمة الموثقة'), (2.2, 4.6), '3SJD2:evidence')
++        for label, key in (('اسم المعتمد', 'approver'), ('معرف المعتمد', 'actor_id'),
++                           ('تاريخ القرار UTC', 'decided_at'), ('الإصدار المعتمد', 'version'),
++                           ('معرف سجل القرار', 'evidence_id'), ('بصمة لقطة المراجعة SHA256', 'snapshot_hash')):
++            cells = evidence.add_row().cells
++            cells[0].text, cells[1].text = label, str(approval_metadata[key])
++    else:
++        rtl(doc.add_paragraph('لا يوجد اعتماد إلكتروني موثق لهذا الإصدار.'))
++    for tbl in doc.tables:
++        widths = [column.width for column in tbl.columns]
++        for row_index, row in enumerate(tbl.rows):
++            for cell, width in zip(row.cells, widths):
++                cell.width = width
++                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
++                for paragraph in cell.paragraphs:
++                    rtl(paragraph)
++                    if paragraph.text and paragraph.text.isascii():
++                        paragraph._p.pPr.find(qn('w:bidi')).set(qn('w:val'), '0')
++                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
++                        for run in paragraph.runs:
++                            run.font.rtl = False
++                    paragraph.paragraph_format.space_after = Pt(5)
++                if row_index and row_index % 2 == 0:
++                    shade = OxmlElement('w:shd')
++                    shade.set(qn('w:fill'), 'F0F4F8')
++                    cell._tc.get_or_add_tcPr().append(shade)
++    output = io.BytesIO()
++    doc.save(output)
++    output.seek(0)
++    return output
+--- /dev/null
++++ b/scripts/migrate_integrity.py
+@@ -0,0 +1,60 @@
++"""Backed-up, transactional Stage 2 upgrade of an existing portal database."""
++import argparse
++from contextlib import closing
++import sqlite3
++
++from backups import backup_database, verify_database
++from database import DB_PATH
++import governance
++
++
++def legacy_values(conn):
++    result = {}
++    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
++        quoted = '"' + name.replace('"', '""') + '"'
++        columns = [r[1] for r in conn.execute(f'PRAGMA table_info({quoted})')]
++        result[name] = (columns, [tuple(r) for r in conn.execute(f'SELECT * FROM {quoted} ORDER BY rowid')])
++    return result
++
++
++def assert_preserved(conn, original):
++    for name, (columns, values) in original.items():
++        quoted = '"' + name.replace('"', '""') + '"'
++        selected = ','.join('"' + c.replace('"', '""') + '"' for c in columns)
++        if [tuple(r) for r in conn.execute(f'SELECT {selected} FROM {quoted} ORDER BY rowid')] != values:
++            raise RuntimeError(f'Preservation check failed for {name}; migration rolled back.')
++
++
++def upgrade_connection(conn):
++    conn.row_factory = sqlite3.Row
++    conn.execute('PRAGMA foreign_keys=ON')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        original = legacy_values(conn)
++        governance.migrate(conn)
++        assert_preserved(conn, original)
++        # verify_database expects tuple rows rather than sqlite3.Row objects.
++        conn.row_factory = None
++        verify_database(conn)
++        counts = {t: conn.execute(f'SELECT count(*) FROM {t}').fetchone()[0]
++                  for t in ('job_descriptions', 'accountabilities', 'interview_schedule')}
++    return counts
++
++
++def migrate_integrity(path=DB_PATH, backup_dir=None):
++    backup = backup_database(path, backup_dir)
++    with closing(sqlite3.connect(path)) as conn:
++        counts = upgrade_connection(conn)
++    return counts, backup
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--database', default=DB_PATH)
++    args = parser.parse_args()
++    counts, backup = migrate_integrity(args.database)
++    print(f'Preserved records: {counts}. Verified backup: {backup}')
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/scripts/verify_stage2_migration.py
+@@ -0,0 +1,47 @@
++"""Read-only-source migration rehearsal; never upgrades the source database."""
++import argparse
++from contextlib import closing
++import hashlib
++from pathlib import Path
++import sqlite3
++import tempfile
++
++from backups import readonly_connection, verify_database
++from database import DB_PATH
++from scripts.migrate_integrity import upgrade_connection
++
++
++def verify(path=DB_PATH, work_dir=None):
++    source = Path(path)
++    before = hashlib.sha256(source.read_bytes()).hexdigest()
++    with tempfile.TemporaryDirectory(prefix='stage2-', dir=work_dir) as folder:
++        trial = Path(folder) / 'trial.db'
++        with closing(readonly_connection(source)) as src, closing(sqlite3.connect(trial)) as dst:
++            src.backup(dst)
++            verify_database(dst)
++            counts = upgrade_connection(dst)
++            first = list(dst.iterdump())
++            assert upgrade_connection(dst) == counts
++            if first != list(dst.iterdump()):
++                raise RuntimeError('Repeated migration changed the database.')
++            restored = Path(folder) / 'restored.db'
++            with closing(sqlite3.connect(restored)) as recovery:
++                dst.backup(recovery)
++                verify_database(recovery)
++                if list(recovery.iterdump()) != list(dst.iterdump()):
++                    raise RuntimeError('Migration restore comparison failed.')
++    if before != hashlib.sha256(source.read_bytes()).hexdigest():
++        raise RuntimeError('Source database changed during rehearsal.')
++    return counts
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--database', default=DB_PATH)
++    parser.add_argument('--work-dir')
++    args = parser.parse_args()
++    print(f'Migration, preservation, idempotence and restore verified: {verify(args.database, args.work_dir)}')
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/tests/test_stage2_integrity.py
+@@ -0,0 +1,284 @@
++"""Synthetic Stage 2 governance, migration, concurrency and preservation regressions."""
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing
++from pathlib import Path
++import sqlite3
++import threading
++
++import pytest
++
++import database
++import governance
++
++
++def propose(section='Job Purpose', clause='purpose', text='هدف جديد'):
++    old = database.get_accountabilities(1)[0]['description'] if section == 'Accountability' else database.get_jd_by_id(1)[clause]
++    return database.submit_modification_request(1, section, clause, old, text, 'سبب موثق', actor_id=2)
++
++
++def dump(path):
++    with closing(sqlite3.connect(path)) as conn:
++        return list(conn.iterdump())
++
++
++@pytest.mark.parametrize('field', governance.CONTENT_FIELDS)
++def test_every_metadata_mutation_versions_parent_and_invalidates_approval(sign_in, db, field):
++    sign_in()
++    database.approve_jd_as_is(1, actor_id=2)
++    with sqlite3.connect(db) as conn:
++        conn.execute(f'UPDATE job_descriptions SET {field}=? WHERE id=1', ('قيمة جديدة',))
++    card = database.get_jd_by_id(1)
++    assert (card['version'], card['status'], card['review_hash']) == (2, 'قيد المراجعة', None)
++    assert database.get_approval_metadata(1) is None
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(1, actor_id=2)
++
++
++@pytest.mark.parametrize('statement', [
++    "UPDATE accountabilities SET description='نص جديد' WHERE id=1",
++    "UPDATE accountabilities SET kpi='99%' WHERE id=1",
++    'UPDATE accountabilities SET item_order=7 WHERE id=1',
++    'UPDATE accountabilities SET is_active=0 WHERE id=1',
++    "INSERT INTO accountabilities(jd_id,item_order,description) VALUES(1,2,'إضافة')",
++    'DELETE FROM accountabilities WHERE id=1',
++])
++def test_all_responsibility_mutations_version_parent(db, statement):
++    with sqlite3.connect(db) as conn:
++        conn.execute(statement)
++    assert database.get_jd_by_id(1)['version'] == 2
++    assert database.get_jd_by_id(2)['version'] == 1
++
++
++def test_noop_content_updates_do_not_increment_version(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute('UPDATE job_descriptions SET purpose=purpose WHERE id=1')
++        conn.execute('UPDATE accountabilities SET description=description,kpi=kpi WHERE id=1')
++    assert database.get_jd_by_id(1)['version'] == 1
++
++
++@pytest.mark.parametrize('kind', ['unrelated_field', 'kpi', 'aba'])
++def test_whole_card_conflict_even_if_target_text_unchanged(sign_in, db, kind):
++    sign_in()
++    rid = propose()
++    with sqlite3.connect(db) as conn:
++        if kind == 'unrelated_field':
++            conn.execute("UPDATE job_descriptions SET competencies='جدارات جديدة' WHERE id=1")
++        elif kind == 'kpi':
++            conn.execute("UPDATE accountabilities SET kpi='100%' WHERE id=1")
++        else:
++            conn.execute("UPDATE job_descriptions SET purpose='مؤقت' WHERE id=1")
++            conn.execute("UPDATE job_descriptions SET purpose='هدف أصلي' WHERE id=1")
++    before = dump(db)
++    sign_in('hr')
++    assert not database.review_modification_request(rid, 'Accept', '', actor_id=1)[0]
++    assert dump(db) == before
++
++
++@pytest.mark.parametrize('decision', ['Accept', 'Reject'])
++def test_decision_evidence_exact_immutable_and_survives_future_edits(sign_in, db, decision):
++    sign_in()
++    rid = propose('Competencies', 'competencies', 'سلوكية: تعاون\nفنية: تحليل')
++    sign_in('hr')
++    with closing(database.get_connection()) as conn:
++        before = governance.snapshot(conn, 1)
++    assert database.review_modification_request(rid, decision, 'قرار', actor_id=1)[0]
++    evidence = database.get_decision_evidence(1)[0]
++    assert evidence['snapshot_json'] == before
++    assert evidence['actor_id'] == 1 and evidence['card_version'] == 1
++    assert evidence['result_json']['card']['version'] == (2 if decision == 'Accept' else 1)
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE job_descriptions SET hazards='تغيير لاحق' WHERE id=1")
++        for statement in ('UPDATE jd_audit_trail SET snapshot_json=NULL', 'DELETE FROM jd_audit_trail',
++                          "UPDATE modification_requests SET status='قيد الانتظار'", 'DELETE FROM modification_requests'):
++            with pytest.raises(sqlite3.IntegrityError):
++                conn.execute(statement)
++    assert database.get_decision_evidence(1)[0] == evidence
++
++
++def test_hash_verification_detects_tampering_even_if_owner_drops_guard(sign_in, db):
++    sign_in()
++    database.approve_jd_as_is(1, actor_id=2)
++    with sqlite3.connect(db) as conn:
++        conn.execute('DROP TRIGGER stage2_audit_no_update')
++        conn.execute("UPDATE jd_audit_trail SET snapshot_json='{}'")
++    with pytest.raises(ValueError):
++        database.get_decision_evidence(1)
++
++
++def test_legacy_unbound_request_requires_resubmission_for_acceptance(sign_in, db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO modification_requests(jd_id,section_name,original_text,proposed_text,justification,requested_by) VALUES(1,'Job Purpose','هدف أصلي','جديد','سبب','قديم')")
++    sign_in('hr')
++    before = dump(db)
++    assert not database.review_modification_request(1, 'Accept', '', actor_id=1)[0]
++    assert dump(db) == before
++    assert database.review_modification_request(1, 'Reject', 'إعادة تقديم', actor_id=1)[0]
++
++
++def test_full_card_workflow_reject_resubmit_approve_and_replay(sign_in, db):
++    sign_in('hr')
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(id,title,status) VALUES(3,'مسودة','Draft')")
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(3, actor_id=1)
++    database.request_jd_review(3, actor_id=1)
++    with pytest.raises(ValueError):
++        database.request_jd_review(3, actor_id=1)
++    database.decide_jd_review(3, 'Rejected', actor_id=1)
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(3, actor_id=1)
++    database.request_jd_review(3, actor_id=1)
++    assert database.approve_jd_as_is(3, actor_id=1)
++    before = dump(db)
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(3, actor_id=1)
++    assert dump(db) == before
++    assert len(database.get_decision_evidence(3)) == 2
++
++
++def test_invalid_domain_states_blocked_by_database(db):
++    with sqlite3.connect(db) as conn:
++        for status in ('Draft', 'bogus'):
++            with pytest.raises(sqlite3.IntegrityError):
++                conn.execute('UPDATE job_descriptions SET status=? WHERE id=1', (status,))
++        with pytest.raises(sqlite3.IntegrityError):
++            conn.execute('UPDATE job_descriptions SET version=0 WHERE id=1')
++        with pytest.raises(sqlite3.IntegrityError):
++            conn.execute('UPDATE accountabilities SET jd_id=2 WHERE id=1')
++
++
++def test_stale_full_card_request_and_display_token_cannot_approve(sign_in, db):
++    sign_in()
++    card = database.get_jd_by_id(1)
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE accountabilities SET kpi='جديد' WHERE id=1")
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(1, actor_id=2)
++    database.request_jd_review(1, actor_id=2)
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(1, actor_id=2, expected_version=card['version'], expected_hash=card['review_hash'])
++    assert database.approve_jd_as_is(1, actor_id=2)
++
++
++def test_final_approval_audit_failure_rolls_back_decision(sign_in, db):
++    sign_in()
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TRIGGER fail_evidence BEFORE INSERT ON jd_audit_trail BEGIN SELECT RAISE(ABORT,'evidence failure'); END")
++    before = dump(db)
++    with pytest.raises(sqlite3.IntegrityError):
++        database.approve_jd_as_is(1, actor_id=2)
++    assert dump(db) == before
++
++
++def test_competing_reviewers_create_exactly_one_decision(sign_in, monkeypatch, db):
++    sign_in()
++    rid = propose()
++    sign_in('hr')
++    # Auth is already covered by the role tests; use a thread-safe synthetic actor.
++    import auth
++    monkeypatch.setattr(auth, 'require_actor', lambda actor_id: {'id': 1})
++    gate = threading.Barrier(2)
++    def review(decision):
++        gate.wait(timeout=5)
++        return database.review_modification_request(rid, decision, '', actor_id=1)[0]
++    with ThreadPoolExecutor(2) as pool:
++        first = pool.submit(review, 'Accept')
++        second = pool.submit(review, 'Reject')
++        results = [first.result(timeout=10), second.result(timeout=10)]
++    assert sorted(results) == [False, True]
++    assert len(database.get_decision_evidence(1)) == 1
++
++
++@pytest.mark.parametrize('status,notes', [(None, None), ('', ''), ('  ', '  '), ('مؤجلة', None)])
++def test_interview_partial_edits_preserve_notes_and_outcomes(sign_in, db, status, notes):
++    sign_in('hr')
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO interview_schedule(id,department,manager_name,status,notes,discussion_topics) VALUES(1,'إدارة','مدير','مكتملة','مخرجات وملاحظات المرشح','نقاش محفوظ')")
++    database.update_interview_status(1, status, notes, actor_id=1)
++    saved = database.get_interview_schedule()[0]
++    assert saved['notes'] == 'مخرجات وملاحظات المرشح'
++    assert saved['discussion_topics'] == 'نقاش محفوظ'
++    assert saved['status'] == ('مؤجلة' if status == 'مؤجلة' else 'مكتملة')
++
++
++def test_interview_stale_edit_and_explicit_clear(sign_in, db):
++    sign_in('hr')
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO interview_schedule(id,department,manager_name,status,notes) VALUES(1,'إدارة','مدير','مكتملة','قديم')")
++    baseline = database.get_interview_schedule()[0]
++    database.update_interview_status(1, notes='مخرجات أحدث', actor_id=1)
++    before = dump(db)
++    with pytest.raises(ValueError):
++        database.update_interview_status(1, 'قيد المراجعة', 'قديم', actor_id=1, expected=baseline)
++    assert dump(db) == before
++    database.update_interview_status(1, actor_id=1, clear_notes=True)
++    assert database.get_interview_schedule()[0]['notes'] == ''
++
++
++def test_additive_migration_preserves_all_legacy_rows_and_is_idempotent(tmp_path):
++    path = tmp_path / 'legacy.db'
++    with closing(sqlite3.connect(path)) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.executescript(Path(__file__).with_name('schema.sql').read_text(encoding='utf-8'))
++        with conn:
++            conn.execute("INSERT INTO job_descriptions(id,title,version) VALUES(26,'العربية',8)")
++            conn.execute("INSERT INTO accountabilities(id,jd_id,item_order,description) VALUES(399,26,1,'مسؤولية')")
++            conn.execute("INSERT INTO interview_schedule(id,department,manager_name,notes) VALUES(9,'إدارة','مدير','مخرجات')")
++        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
++        original = {t: ([r[1] for r in conn.execute(f'PRAGMA table_info({t})')],
++                        [tuple(r) for r in conn.execute(f'SELECT * FROM {t} ORDER BY rowid')]) for t in tables}
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            governance.migrate(conn)
++        for table, (columns, rows) in original.items():
++            assert [tuple(r) for r in conn.execute(f'SELECT {",".join(columns)} FROM {table} ORDER BY rowid')] == rows
++        first = list(conn.iterdump())
++        with conn:
++            governance.migrate(conn)
++        assert list(conn.iterdump()) == first
++
++
++def test_migration_rolls_back_ddl_on_failure(tmp_path):
++    path = tmp_path / 'legacy.db'
++    with closing(sqlite3.connect(path)) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.executescript(Path(__file__).with_name('schema.sql').read_text(encoding='utf-8'))
++        # Authorizer simulates a failure midway through additive DDL.
++        calls = 0
++        def authorizer(action, *args):
++            nonlocal calls
++            if action == sqlite3.SQLITE_ALTER_TABLE:
++                calls += 1
++                if calls == 3:
++                    return sqlite3.SQLITE_DENY
++            return sqlite3.SQLITE_OK
++        before = list(conn.iterdump())
++        conn.set_authorizer(authorizer)
++        with pytest.raises(sqlite3.DatabaseError):
++            with conn:
++                conn.execute('BEGIN IMMEDIATE')
++                governance.migrate(conn)
++        conn.set_authorizer(None)
++        assert list(conn.iterdump()) == before
++
++
++def test_migration_command_backs_up_preserves_and_rehearses_without_source_writes(db, tmp_path):
++    from scripts.migrate_integrity import migrate_integrity
++    from scripts.verify_stage2_migration import verify
++    before = dump(db)
++    assert verify(db, tmp_path) == {'job_descriptions': 2, 'accountabilities': 2, 'interview_schedule': 0}
++    assert dump(db) == before
++    counts, backup = migrate_integrity(db, tmp_path / 'backups')
++    assert counts['job_descriptions'] == 2
++    assert dump(backup) == before and dump(db) == before
++
++
++def test_migration_command_backup_failure_prevents_writes(db, monkeypatch):
++    from scripts import migrate_integrity
++    def fail(*args):
++        raise OSError('synthetic disk full')
++    monkeypatch.setattr(migrate_integrity, 'backup_database', fail)
++    before = dump(db)
++    with pytest.raises(OSError):
++        migrate_integrity.migrate_integrity(db)
++    assert dump(db) == before
+--- /dev/null
++++ b/tests/test_stage2_docx.py
+@@ -0,0 +1,168 @@
++"""Word contract parity, visible edits, metadata and Arabic/RTL layout structure."""
++import io
++import sqlite3
++
++import docx
++from docx.oxml.ns import qn
++import pytest
++
++import database
++from docx_parser import export_jd_to_docx, parse_jd_docx
++
++
++def card():
++    return {
++        'id': 26, 'job_code': '3S-HR-026', 'title': 'مدير الموارد البشرية',
++        'department': 'إدارة الموارد البشرية', 'sector': 'القطاع الإداري',
++        'reports_to': 'المدير العام', 'purpose': '  هدف عربي\nسطر ثانٍ  ',
++        'dimensions': 'النطاق الإشرافي: 3', 'frameworks': 'سلطات وحدود',
++        'qualifications': 'بكالوريوس\nخبرة خمس سنوات',
++        'competencies': 'سلوكية: التعاون والإنصات\nفنية: تحليل البيانات\nTechnical: SQL\nمعيار عام',
++        'hazards': 'مخاطر مسجلة', 'safe_practices': 'إجراءات موثقة',
++        'internal_relations': 'الإدارات الداخلية', 'external_relations': 'جهات خارجية',
++        'approvals': 'توقيع مصدر قديم\nتاريخ غير محدد', 'version': 7, 'status': 'قيد المراجعة',
++    }
++
++
++def rows():
++    return [{'item_order': 2, 'description': 'نص عربي متكرر', 'kpi': '97%\nشهرياً'},
++            {'item_order': 4, 'description': 'نص عربي متكرر', 'kpi': ''},
++            {'item_order': 9, 'description': '  فقرة\nثانية  ', 'kpi': '—'}]
++
++
++def stream(document):
++    result = io.BytesIO()
++    document.save(result)
++    result.seek(0)
++    return result
++
++
++def test_all_fields_responsibility_order_kpis_and_criteria_roundtrip():
++    original = card()
++    parsed = parse_jd_docx(export_jd_to_docx(original, rows()))
++    for key, value in original.items():
++        assert parsed['portal_card_id' if key == 'id' else key] == value
++    assert parsed['accountabilities'] == rows()
++    assert parsed['competency_criteria']['behavioral'] == ['سلوكية: التعاون والإنصات']
++    assert len(parsed['competency_criteria']['technical']) == 2
++    # A repeated round trip retains intentional duplicate responsibilities exactly once per row.
++    parsed['id'] = parsed['portal_card_id']
++    again = parse_jd_docx(export_jd_to_docx(parsed, parsed['accountabilities']))
++    assert again['accountabilities'] == rows()
++    assert again['competencies'] == original['competencies']
++
++
++def test_empty_fields_remain_empty_without_fabricated_safety_or_codes():
++    original = {k: '' for k in card()}
++    original.update(id=1, version=1, status='مسودة')
++    output = export_jd_to_docx(original, [])
++    parsed = parse_jd_docx(output)
++    assert parsed['accountabilities'] == []
++    for key in ('job_code', 'hazards', 'safe_practices', 'approvals', 'competencies', 'purpose'):
++        assert parsed[key] == ''
++    document = docx.Document(output)
++    text = '\n'.join(p.text for p in document.paragraphs)
++    assert 'لا يوجد اعتماد إلكتروني موثق' in text
++    assert 'بطاقة الوصف والتوصيف الوظيفي المعتمدة' not in text
++    assert '3S-JD-001' not in text
++
++
++def test_parser_reads_visible_word_edits_instead_of_hidden_payload():
++    document = docx.Document(export_jd_to_docx(card(), rows()))
++    target = next(p for p in document.paragraphs if p.text == card()['competencies'])
++    # Simulate editing a run in Word; bookmarks remain around the visible text.
++    target.runs[0].text = 'فنية: كفاءة معدلة'
++    parsed = parse_jd_docx(stream(document))
++    assert parsed['competencies'] == 'فنية: كفاءة معدلة'
++
++
++@pytest.mark.parametrize('damage', ['version', 'missing_marker', 'missing_field', 'duplicate_table', 'duplicate_field'])
++def test_damaged_or_unknown_system_format_fails_closed(damage):
++    from copy import deepcopy
++    document = docx.Document(export_jd_to_docx(card(), rows()))
++    if damage == 'version':
++        document.core_properties.identifier = '3S-JD/v999'
++    elif damage == 'missing_marker':
++        document.core_properties.identifier = ''
++    elif damage == 'missing_field':
++        mark = next(b for b in document.element.body.iter(qn('w:bookmarkStart')) if b.get(qn('w:name')) == 's3jd2_competencies')
++        mark.getparent().remove(mark)
++    elif damage == 'duplicate_field':
++        mark = next(b for b in document.element.body.iter(qn('w:bookmarkStart')) if b.get(qn('w:name')) == 's3jd2_competencies')
++        mark.getparent().append(deepcopy(mark))
++    else:
++        document.element.body.append(deepcopy(document.tables[1]._tbl))
++    with pytest.raises(ValueError):
++        parse_jd_docx(stream(document))
++
++
++def test_rtl_tables_headers_widths_and_arabic_paragraphs():
++    document = docx.Document(export_jd_to_docx(card(), rows()))
++    for table in document.tables:
++        assert table._tbl.tblPr.find(qn('w:bidiVisual')) is not None
++        assert table.rows[0]._tr.trPr.find(qn('w:tblHeader')) is not None
++        assert table._tbl.tblPr.find(qn('w:tblBorders')) is not None
++        for row in table.rows:
++            for cell, column in zip(row.cells, table.columns):
++                assert cell.width == column.width
++                for paragraph in cell.paragraphs:
++                    assert paragraph._p.pPr.find(qn('w:bidi')) is not None
++    acc = document.tables[1]
++    assert acc.columns[0].width < acc.columns[1].width
++
++
++def test_current_approval_metadata_exported_and_legacy_text_retained(sign_in, db):
++    sign_in()
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE job_descriptions SET approvals='توقيع المصدر',competencies='فنية: التحليل' WHERE id=1")
++    database.request_jd_review(1, actor_id=2)
++    database.approve_jd_as_is(1, actor_id=2)
++    metadata = database.get_approval_metadata(1)
++    assert metadata['approver'] == 'مستخدم 2' and metadata['version'] == 2
++    result = export_jd_to_docx(database.get_jd_by_id(1), database.get_accountabilities(1), metadata)
++    document = docx.Document(result)
++    text = '\n'.join(c.text for t in document.tables for r in t.rows for c in r.cells)
++    for value in (metadata['approver'], metadata['decided_at'], metadata['snapshot_hash']):
++        assert value in text
++    assert parse_jd_docx(result)['approvals'] == 'توقيع المصدر'
++
++
++def test_reimport_own_export_is_idempotent_and_changed_import_does_not_overwrite(sign_in, db):
++    sign_in('hr')
++    output = export_jd_to_docx(database.get_jd_by_id(1), database.get_accountabilities(1))
++    parsed = parse_jd_docx(output)
++    with sqlite3.connect(db) as conn:
++        before = list(conn.iterdump())
++    assert database.create_or_update_jd(parsed, 'roundtrip.docx', actor_id=1) == 1
++    assert database.create_or_update_jd(parsed, 'roundtrip.docx', actor_id=1) == 1
++    parsed['competencies'] = 'محتوى معدل'
++    with pytest.raises(ValueError):
++        database.create_or_update_jd(parsed, 'roundtrip.docx', actor_id=1)
++    with sqlite3.connect(db) as conn:
++        assert list(conn.iterdump()) == before
++
++
++def test_import_new_system_document_preserves_empty_and_literal_english_values(sign_in, db):
++    sign_in('hr')
++    original = card() | {'id': 99, 'title': 'HR Manager', 'reports_to': '', 'department': '', 'sector': '', 'dimensions': '', 'qualifications': ''}
++    parsed = parse_jd_docx(export_jd_to_docx(original, rows()))
++    jd_id = database.create_or_update_jd(parsed, 'new.docx', actor_id=1)
++    assert database.create_or_update_jd(parsed, 'new.docx', actor_id=1) == jd_id
++    saved = database.get_jd_by_id(jd_id)
++    for field in ('title', 'reports_to', 'department', 'sector', 'dimensions', 'qualifications', 'competencies', 'approvals'):
++        assert saved[field] == original[field]
++    assert [(r['item_order'], r['description'], r['kpi']) for r in database.get_accountabilities(jd_id)] == [
++        (r['item_order'], r['description'], r['kpi']) for r in rows()]
++    assert saved['status'] == 'قيد المراجعة' and database.get_approval_metadata(jd_id) is None
++
++
++@pytest.mark.parametrize('heading', ['Competencies', 'Required Competencies & Skills'])
++def test_legacy_competency_table_retains_all_rows_without_merged_cell_duplication(heading):
++    document = docx.Document()
++    table = document.add_table(rows=3, cols=2)
++    table.rows[0].cells[0].merge(table.rows[0].cells[1]).text = heading
++    table.rows[1].cells[0].merge(table.rows[1].cells[1]).text = 'سلوكية: التعاون'
++    table.rows[2].cells[0].text = 'فنية'
++    table.rows[2].cells[1].text = 'تحليل'
++    parsed = parse_jd_docx(stream(document))
++    assert parsed['competencies'] == 'سلوكية: التعاون\nفنية | تحليل'
+--- /dev/null
++++ b/tests/test_stage2_app.py
+@@ -0,0 +1,52 @@
++"""Real Streamlit form checks for Stage 2 stale-update protection."""
++from pathlib import Path
++import sqlite3
++
++from password_security import hash_password
++import governance
++
++
++def login(db, username):
++    from streamlit.testing.v1 import AppTest
++    with sqlite3.connect(db) as conn:
++        conn.execute('UPDATE users SET password=?', (hash_password('synthetic-secret'),))
++    app = AppTest.from_file(Path(__file__).resolve().parents[1] / 'app.py', default_timeout=10).run()
++    app.sidebar.text_input[0].input(username)
++    app.sidebar.text_input[1].input('synthetic-secret')
++    app.sidebar.button[0].click().run()
++    assert not app.exception and not app.error
++    return app
++
++
++def test_interview_form_detects_concurrent_notes_and_can_reload(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO interview_schedule(id,department,manager_name,status,notes) VALUES(1,'إدارة','مدير','مكتملة','ملاحظات قديمة')")
++    app = login(db, 'hr')
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE interview_schedule SET notes='مخرجات أحدث' WHERE id=1")
++    next(b for b in app.button if b.label == 'حفظ وتحديث حالة المقابلة').click().run()
++    assert not app.exception and app.error
++    with sqlite3.connect(db) as conn:
++        assert conn.execute('SELECT notes,status FROM interview_schedule').fetchone() == ('مخرجات أحدث', 'مكتملة')
++    next(b for b in app.button if b.label == 'إعادة تحميل بيانات المقابلة').click().run()
++    assert not app.exception and not app.error
++    assert next(t for t in app.text_area if t.label == 'الملاحظات ومخرجات الاجتماع المتفق عليها').value == 'مخرجات أحدث'
++
++
++def test_approval_form_binds_decision_to_displayed_revision(db):
++    app = login(db, 'manager')
++    with sqlite3.connect(db) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("UPDATE job_descriptions SET competencies='جدارات أحدث' WHERE id=1")
++        governance.bind_review(conn, 1)
++    next(b for b in app.button if b.label == 'تأكيد الاعتماد والموافقة النهائية').click().run()
++    assert not app.exception and app.error
++    with sqlite3.connect(db) as conn:
++        assert conn.execute('SELECT status,version FROM job_descriptions WHERE id=1').fetchone() == ('قيد المراجعة', 2)
++        assert conn.execute('SELECT count(*) FROM jd_audit_trail').fetchone()[0] == 0
++    next(b for b in app.button if b.label == 'إعادة تحميل بيانات المراجعة').click().run()
++    next(b for b in app.button if b.label == 'تأكيد الاعتماد والموافقة النهائية').click().run()
++    assert not app.exception and not app.error
++    with sqlite3.connect(db) as conn:
++        assert conn.execute('SELECT status FROM job_descriptions WHERE id=1').fetchone()[0] == 'معتمد'
++        assert conn.execute('SELECT count(*) FROM jd_audit_trail').fetchone()[0] == 1
+--- /dev/null
++++ b/docs/STAGE2_INTEGRITY.md
+@@ -0,0 +1,76 @@
++# Stage 2 data integrity and document governance
++
++Implemented and verified on 30 October 2026. This extends the Stage 1 SQLite, Streamlit and python-docx implementation for revision evidence, interview preservation, Word interchange and document states.
++
++## Delivered changes
++
++| Files | Behavior |
++|---|---|
++| `governance.py`; `database.py` | Additive, transactional schema upgrade. All content-field changes and responsibility insert/update/delete operations advance the parent revision. No-op content updates do not. Changed content invalidates approval and the pending review binding. |
++| `database.py` | New modification requests bind the entire card and its responsibilities to an expected revision and SHA-256 fingerprint, alongside the original snapshot. Accepting a stale request fails without changing content, request status or audit history, including unrelated-field changes and changes subsequently reverted. |
++| `governance.py`; `database.py` | Every new accepted/rejected modification decision and final card approval/rejection stores complete before/after content snapshots, hashes, actor ID and reviewed version atomically. SQLite triggers prevent changes to audit events, request bases and completed decisions. Evidence reads verify both snapshot hashes. |
++| `database.py`; `app.py` | Canonical Arabic document statuses with explicit English legacy aliases. Draft → Pending Review → Approved/Rejected; rejected or invalidated cards can be submitted again. Approved content must change before another review. Final decisions require a current review binding, no pending modifications and a matching displayed revision. Replay produces no second event. |
++| `database.py`; `app.py` | Interview forms retain a per-record baseline, load saved fields and reject concurrent changes. Omitted, `None`, empty or whitespace-only notes/status preserve existing values. Explicit backend `clear_notes=True` is required to erase notes. Outcomes and candidate feedback reside in the existing `notes` column; there are no separate outcome/feedback columns. Other interview fields remain untouched. |
++| `docx_format.py`; `docx_parser.py` | Shared editable Word format `3S-JD/v2`. Export/import preserves all supported content fields, competencies, behavioral/technical criterion lines, responsibility order and KPIs, including intentional duplicate descriptions and whitespace. Competencies retain the existing TEXT storage and are also returned as categorized criteria during parsing. |
++| `database.py`; `docx_format.py`; `app.py` | Word exports read content and verified approval evidence in one SQLite read transaction. They include the actual status/version, portal card ID, recorded job code, safety fields, legacy source approval text and current revision-bound approver, actor ID, UTC decision timestamp, version, evidence ID and snapshot hash. Missing codes/safety data stay empty; missing electronic approval is stated explicitly. |
++| `database.py` | Reimporting a matching v2 export returns the existing card ID without creating rows or changing history. Repeated imports of a new v2 document also return its first imported card. A changed known document must use the modification workflow rather than overwriting or silently creating another card. Imported approval text never authorizes electronic approval. |
++| `app.py` | Competencies and source approval text appear in both full-card views. Status filters include Draft/Rejected. Revision-bound approval and interview reload controls recover from stale form conflicts. Review comparisons label the saved request base accurately. |
++| `scripts/migrate_integrity.py`; `scripts/verify_stage2_migration.py` | Verified backup before upgrade; transaction-wide comparison of every preexisting column, row, ID and sequence; integrity/FK checks; read-only-source migration/idempotence/restore rehearsal. |
++| `tests/conftest.py`; three new Stage 2 test files | Apply the same additive migration to synthetic fixtures. All 47 original test cases are retained without weakening their assertions; 60 cases cover the new behaviors. |
++| `.gitignore`; `.dockerignore` | Exclude Stage 2 working copies and synthetic visual QA artifacts. |
++
++## State and evidence rules
++
++Canonical stored transition values are `مسودة`, `قيد المراجعة`, `معتمد`, and `مرفوض`. The read boundary also recognizes `Draft`, `Under Review`, `Pending Review`, `Approved`, and `Rejected`. Existing stored spellings are not rewritten by the migration. Workflow writes use canonical Arabic. Interview statuses belong to a separate domain.
++
++Responsibility changes advance the parent revision even when made through another SQLite connection. Child reparenting and version decreases are rejected. Accepted modification requests advance the revision exactly once, then bind that resulting revision for final review. Arbitrary content changes invalidate the pending review token and require resubmission. Each responsibility inserted during a new bulk import advances the parent counter, so an initial import can begin above revision 1.
++
++Final full-card approval remains available to the assigned actor or HR under the existing Stage 1 authorization policy. Full-card rejection is available to HR through `decide_jd_review`. Full-card decisions and modification decisions use `BEGIN IMMEDIATE`; concurrent reviewers cannot both finalize the same pending state. Manager/employee final approval widgets retain the revision originally displayed across reruns.
++
++At upgrade, existing pending cards receive a binding to their current content. This starts Stage 2 governance; it does not reconstruct a historical review request. Historical approved statuses remain unchanged and do not acquire fabricated electronic evidence. Legacy pending modification requests lack a provable complete base revision: acceptance is blocked, while HR can reject them and the assigned actor can submit a fresh request. The existing request is preserved.
++
++The snapshots include all card content fields, the reviewed status/version and all responsibility rows, including inactive rows. Both the pre-decision content and resulting state are retained. Historical timestamps and attribution are unchanged. New decision timestamps use UTC.
++
++SQLite guards provide append-only protection through ordinary application/SQL operations. An owner with unrestricted file/schema access can remove guards or rewrite data and hashes; these controls are not an externally signed or off-host archive. Existing history without snapshots cannot be retroactively reconstructed.
++
++## Word contract and visual verification
++
++V2 uses Word bookmarks to identify editable visible text and a tagged three-column responsibility table. The parser reads those visible paragraphs and cells, rather than an embedded JSON copy. Unknown format versions, missing/duplicated required bookmarks and missing/duplicated responsibility tables fail explicitly. Preserve the bookmarks and table structure when editing in Word. System-export import deduplication applies to v2; arbitrary legacy uploads still need the broader import-identity policy from AUD-013/AUD-016.
++
++All 26 supplied legacy source documents were compared against the Stage 1 parser and produced identical dictionaries. Legacy competency tables additionally preserve multiple rows and merged cells, including `Competencies & Skills` headers. Older unversioned portal exports are not the v2 interchange contract.
++
++A synthetic Arabic export with 12 responsibilities, competency criteria and full approval evidence was rendered in native Microsoft Word. The first inspection exposed table clipping; the final exporter sets consistent grid/cell widths, logical RTL alignment, repeating headers and LTR dates/hashes. Both regenerated pages were visually inspected with clean tables and pagination. Native Word save/reopen preserved every parsed field and responsibility exactly. The bundled `render_docx.py` was attempted but could not convert because LibreOffice is absent; native Word was used for this verification. No personnel document was rendered or included in the patch.
++
++The table implementation follows the [python-docx table API](https://python-docx.readthedocs.io/en/latest/api/table.html), and logical paragraph alignment uses the Open XML [justification values](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.justificationvalues?view=openxml-3.0.1).
++
++## Verification evidence
++
++- Required regression command: **107 passed**, no failures or skips, in **16.26 seconds**. This includes all **47 existing + 60 new** cases. Forty upstream `importlib.metadata` deprecation warnings were emitted by Streamlit AppTest.
++- Required dependency command: **No broken requirements found**.
++- Tests cover every core metadata field, all responsibility mutation types, no-op updates, unrelated-field and ABA conflicts, immutable/hash-verified evidence, migration rollback and backup failure, canonical transitions/replay, simultaneous reviewers, partial/stale interviews, DOCX round trips and real Streamlit stale-form recovery.
++- The required test command passed outside the Windows sandbox because its default temp directory and Streamlit local socket setup are restricted inside the sandbox. No real account or business row is used by pytest.
++- Read-only-source rehearsal verified preservation, repeat-upgrade idempotence, integrity, foreign keys and exact restore on an isolated copy of the supplied database.
++- The local database was then upgraded with **26 cards, 399 responsibilities and 9 interviews** preserved. The migration compared every preexisting value and ID across all tables, including users, requests, audit events and sequences, before committing. Credentials and content were not printed.
++- Verified pre-upgrade backup: `data/backups/job_descriptions_20261030T091225.817992Z_2272655a.db`.
++- Unified patch: `docs/changes/stage2-integrity.patch`. It excludes databases, backups and visual QA artifacts. Patch application is checked against the Stage 1 text baseline, with reconstructed files compared to the delivered files.
++
++## Commands and recovery
++
++From the project root:
++
++```powershell
++$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
++.\.venv\Scripts\python -B -m pytest -q
++.\.venv\Scripts\python -m pip check
++
++# Read-only source rehearsal; uses a disposable directory for copies.
++.\.venv\Scripts\python -B -m scripts.verify_stage2_migration --work-dir _stage2_work
++
++# For another existing deployment, stop writers before upgrading.
++# The supplied local database has already been upgraded.
++.\.venv\Scripts\python -B -m scripts.migrate_integrity
++```
++
++`JD_DB_PATH` selects an existing durable database, as in Stage 1. Normal application startup also applies this idempotent upgrade after its verified startup backup. Migration failure rolls back the additive DDL and blocks startup. Fresh installations retain the original explicit account-provisioning flow.
++
++For recovery, stop writers and use the existing restore command to restore the pre-upgrade backup into a **new** path. Never overwrite an open database. Run the matching Stage 1 code against that restored path when rolling back application code; Stage 2 startup would apply the additive migration again. Keep the current database for reconciliation of any writes made after the backup. No rollback action deletes current data.

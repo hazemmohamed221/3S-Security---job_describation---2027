@@ -1,0 +1,1699 @@
+--- a/database.py
++++ b/database.py
+@@ -13,6 +13,8 @@
+ import openpyxl
+ from docx_parser import parse_jd_docx
+ import governance
++from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
++from upload_security import sanitize_docx_filename
+ 
+ DB_PATH = os.environ.get("JD_DB_PATH", os.path.join(os.path.dirname(__file__), "job_descriptions.db"))
+ 
+@@ -123,8 +125,16 @@
+ def get_connection():
+     """Returns a connection to the SQLite database with row_factory enabled."""
+     conn = sqlite3.connect(DB_PATH)
+-    conn.row_factory = sqlite3.Row
+-    conn.execute("PRAGMA foreign_keys=ON")
++    try:
++        conn.execute("PRAGMA foreign_keys=ON")
++        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
++        conn.execute("PRAGMA synchronous=NORMAL")
++        if mode != 'wal':
++            raise RuntimeError('The portal requires a file-backed SQLite database with WAL support.')
++        conn.row_factory = sqlite3.Row
++    except BaseException:
++        conn.close()
++        raise
+     return conn
+ 
+ 
+@@ -252,6 +262,7 @@
+ def _insert_parsed_jd(conn, parsed, source_file, changed_by="مسؤول النظام", *, commit=True, notes="تمت الإضافة من ملف Word المعتمد"):
+     """Inserts a parsed JD dictionary and its accountabilities into DB with auto Arabic translation."""
+     cur = conn.cursor()
++    source_file = sanitize_docx_filename(source_file)
+ 
+     system_export = parsed.get('format_version') == 2
+     raw_title = parsed.get('title', 'بطاقة وصف وظيفي جديدة')
+@@ -348,7 +359,7 @@
+                     day = str(row[3]).strip() if row[3] else ''
+                     time_val = str(row[4]).strip() if row[4] else ''
+                     topics = str(row[5]).strip() if row[5] else ''
+-                    status = str(row[6]).strip() if row[6] else 'قيد المراجعة'
++                    status = InterviewStatus.parse(str(row[6]).strip() if row[6] else InterviewStatus.PENDING_REVIEW).value
+                     notes = str(row[7]).strip() if row[7] else ''
+ 
+                     cur.execute("""
+@@ -567,6 +578,8 @@
+     ORDER BY m.requested_at DESC
+     """, (username,))
+     rows = [dict(r) for r in cur.fetchall()]
++    for row in rows:
++        row['status'] = display_status(ReviewStatus, row['status'])
+     conn.close()
+     return rows
+ 
+@@ -574,19 +587,22 @@
+ def review_modification_request(request_id, decision, reviewer_comments, *, actor_id):
+     with _write_connection() as conn:
+         actor = _require_actor(conn, actor_id, admin=True)
+-        decisions = {"Accept": "مقبول", "مقبول": "مقبول", "Reject": "مرفوض", "مرفوض": "مرفوض"}
+-        if decision not in decisions:
++        try:
++            status = ReviewStatus.parse(decision)
++        except ValueError:
++            return False, "قرار المراجعة غير صالح."
++        if status == ReviewStatus.PENDING:
+             return False, "قرار المراجعة غير صالح."
+         req = conn.execute("SELECT * FROM modification_requests WHERE id=?", (request_id,)).fetchone()
+         if not req:
+             return False, "طلب التعديل غير موجود."
+-        if req['status'] not in ('Pending', 'قيد الانتظار'):
++        if ReviewStatus.parse(req['status']) != ReviewStatus.PENDING:
+             return False, "تمت مراجعة هذا الطلب بالفعل."
+         try:
+             kind, target, current = _resolve_target(conn, req['jd_id'], req['section_name'], req['clause_id'])
+         except ValueError as exc:
+             return False, str(exc)
+-        status = decisions[decision]
++        status = status.value
+         before = governance.snapshot(conn, req['jd_id'])
+         if status == 'مقبول' and (req['expected_version'] != before['card']['version'] or
+                                   req['expected_hash'] != governance.content_hash(before)):
+@@ -766,6 +782,8 @@
+     cur = conn.cursor()
+     cur.execute("SELECT * FROM interview_schedule ORDER BY seq_num ASC")
+     rows = [dict(r) for r in cur.fetchall()]
++    for row in rows:
++        row['status'] = display_status(InterviewStatus, row['status'])
+     conn.close()
+     return rows
+ 
+@@ -776,9 +794,11 @@
+         current = conn.execute('SELECT * FROM interview_schedule WHERE id=?', (item_id,)).fetchone()
+         if not current:
+             raise ValueError("المقابلة غير موجودة.")
+-        if expected is not None and any(current[k] != expected[k] for k in ('status', 'notes')):
++        if expected is not None and (display_status(InterviewStatus, current['status']) != expected['status'] or current['notes'] != expected['notes']):
+             raise ValueError('تغيرت بيانات المقابلة. يرجى إعادة تحميلها قبل الحفظ.')
+-        new_status = status if isinstance(status, str) and status.strip() else current['status']
++        new_status = display_status(InterviewStatus, current['status'])
++        if status is not None and not (isinstance(status, str) and not status.strip()):
++            new_status = InterviewStatus.parse(status).value
+         new_notes = '' if clear_notes else (notes if isinstance(notes, str) and notes.strip() else current['notes'])
+         conn.execute('UPDATE interview_schedule SET status=?,notes=? WHERE id=?', (new_status, new_notes, item_id))
+ 
+@@ -792,6 +812,9 @@
+ 
+     cur.execute("SELECT COUNT(*) as approved_jds FROM job_descriptions WHERE status = 'معتمد' OR status = 'Approved'")
+     approved_jds = cur.fetchone()['approved_jds']
++
++    cur.execute("SELECT COUNT(*) FROM job_descriptions WHERE status IN ('قيد المراجعة','Under Review','Pending Review')")
++    under_review = cur.fetchone()[0]
+ 
+     cur.execute("SELECT COUNT(*) as pending_mods FROM modification_requests WHERE status = 'قيد الانتظار' OR status = 'Pending'")
+     pending_mods = cur.fetchone()['pending_mods']
+@@ -803,7 +826,7 @@
+     return {
+         'total_jds': total_jds,
+         'approved_jds': approved_jds,
+-        'under_review': total_jds - approved_jds,
++        'under_review': under_review,
+         'pending_mods': pending_mods,
+         'departments_count': depts_count
+     }
+--- a/governance.py
++++ b/governance.py
+@@ -1,6 +1,7 @@
+ """Revision-bound SQLite governance; additive migration preserves legacy values."""
+ import hashlib
+ import json
++from statuses import CardStatus, ALIASES, install_constraints
+ 
+ CONTENT_FIELDS = (
+     'job_code', 'title', 'department', 'sector', 'reports_to', 'purpose',
+@@ -8,19 +9,11 @@
+     'safe_practices', 'internal_relations', 'external_relations', 'approvals',
+     'source_file',
+ )
+-STATUS_ALIASES = {
+-    'Draft': 'مسودة', 'مسودة': 'مسودة',
+-    'Under Review': 'قيد المراجعة', 'Pending Review': 'قيد المراجعة',
+-    'قيد المراجعة': 'قيد المراجعة',
+-    'Approved': 'معتمد', 'معتمد': 'معتمد',
+-    'Rejected': 'مرفوض', 'مرفوض': 'مرفوض',
+-}
++STATUS_ALIASES = {key: status.value for key, status in ALIASES[CardStatus].items()}
+ 
+ 
+ def canonical_status(value):
+-    if value not in STATUS_ALIASES:
+-        raise ValueError('حالة الوثيقة غير صالحة.')
+-    return STATUS_ALIASES[value]
++    return CardStatus.parse(value).value
+ 
+ 
+ def encode(value):
+@@ -124,3 +117,4 @@
+         for row in conn.execute('SELECT id,status FROM job_descriptions').fetchall():
+             if STATUS_ALIASES.get(row['status']) == 'قيد المراجعة':
+                 bind_review(conn, row['id'])
++    install_constraints(conn)
+--- a/docx_parser.py
++++ b/docx_parser.py
+@@ -12,6 +12,7 @@
+ from docx.oxml import OxmlElement, parse_xml
+ from docx.oxml.ns import nsdecls, qn
+ from docx_format import parse_system_document
++from upload_security import validated_docx
+ 
+ 
+ def set_cell_background(cell, fill_hex):
+@@ -29,19 +30,27 @@
+     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+ 
+ 
++def _fallback_title(file_name):
++    # Safe transport names use underscores; retain the human-readable title for
++    # legacy documents that contain no position-title field.
++    title = file_name.removesuffix('.docx').replace('_', ' ').strip()
++    if title.upper().startswith('JD '):
++        title = title[3:].lstrip(' -')
++    return title
++
++
+ def parse_jd_docx(file_source):
+     """
+     Parses a Job Description Word document (.docx).
+     Accepts either a file path (str) or a file-like stream (io.BytesIO).
+     Supports English & Arabic table headers.
+     """
+-    if isinstance(file_source, (str, bytes, os.PathLike)):
+-        doc = docx.Document(file_source)
+-        file_name = os.path.basename(file_source) if isinstance(file_source, str) else "uploaded_document.docx"
+-    else:
+-        file_source.seek(0)
+-        doc = docx.Document(file_source)
+-        file_name = getattr(file_source, 'name', 'uploaded_document.docx')
++    validated = validated_docx(file_source)
++    file_name = validated.name
++    try:
++        doc = docx.Document(validated)
++    except Exception as exc:
++        raise ValueError('تعذر قراءة ملف Word. تحقق من سلامة المستند وصيغته.') from exc
+ 
+     system_document = parse_system_document(doc, file_name)
+     if system_document is not None:
+@@ -69,7 +78,7 @@
+ 
+     if not doc.tables:
+         text_lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+-        res['title'] = file_name.replace('.docx', '').replace('JD -', '').replace('JD _', '').replace('JD-', '').strip()
++        res['title'] = _fallback_title(file_name)
+         res['purpose'] = '\n'.join(text_lines)
+         return res
+ 
+@@ -177,7 +186,7 @@
+             res['approvals'] = '\n'.join(appr)
+ 
+     if not res['title']:
+-        clean_name = file_name.replace('.docx', '').replace('JD -', '').replace('JD _', '').replace('JD-', '').strip()
++        clean_name = _fallback_title(file_name)
+         res['title'] = clean_name
+ 
+     return res
+--- a/app.py
++++ b/app.py
+@@ -15,6 +15,8 @@
+ import docx_parser
+ import utils
+ import auth
++from statuses import CardStatus, InterviewStatus
++from upload_security import sanitize_docx_filename, download_filename, upload_limit_megabytes
+ 
+ def _run_write(operation, *args, **kwargs):
+     """Present safe failures without continuing into success/rerun handlers."""
+@@ -304,15 +306,17 @@
+         uploaded_files = st.file_uploader(
+             "اختر ملف أو عدة ملفات بصيغة Word (.docx) للرفع والاستيراد",
+             type=["docx"],
+-            accept_multiple_files=True
++            accept_multiple_files=True,
++            max_upload_size=upload_limit_megabytes()
+         )
+ 
+         if uploaded_files:
+             st.markdown(f"**تم اختيار {len(uploaded_files)} ملف(ات) للمعالجة.**")
+ 
+-            for uploaded_file in uploaded_files:
++            for upload_index, uploaded_file in enumerate(uploaded_files):
++                safe_name = sanitize_docx_filename(uploaded_file.name)
+                 st.markdown("---")
+-                with st.expander(f"📄 معاينة استخراج البيانات من: {uploaded_file.name}", expanded=True):
++                with st.expander(f"📄 معاينة استخراج البيانات من: {safe_name}", expanded=True):
+                     try:
+                         parsed_data = docx_parser.parse_jd_docx(uploaded_file)
+ 
+@@ -340,17 +344,20 @@
+                             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+ 
+                         # Confirmation button to insert into DB
+-                        if st.button(f"💾 تأكيد وإدراج بطاقة '{title_preview}' في قاعدة البيانات", key=f"btn_import_{uploaded_file.name}"):
++                        if st.button(f"💾 تأكيد وإدراج بطاقة '{title_preview}' في قاعدة البيانات", key=f"btn_import_{upload_index}_{safe_name}"):
+                             new_jd_id = _run_write(database.create_or_update_jd,
+                                 parsed_jd=parsed_data,
+-                                source_file=uploaded_file.name,
++                                source_file=parsed_data['file_name'],
+                                 actor_id=user['id']
+                             )
+                             st.success(f"تم إدراج بطاقة الوصف الوظيفي '{title_preview}' بنجاح برقم #{new_jd_id}!")
+                             st.rerun()
+ 
+-                    except Exception as e:
+-                        st.error(f"حدث خطأ أثناء معالجة الملف {uploaded_file.name}: {e}")
++                    except ValueError as exc:
++                        st.error(f"تعذر استيراد الملف {safe_name}: {exc}")
++                    except Exception:
++                        logging.getLogger(__name__).exception('DOCX import failed')
++                        st.error(f"تعذر استيراد الملف {safe_name}. يرجى التحقق من الملف والمحاولة مجدداً.")
+ 
+     # --- TAB 4: JOB DESCRIPTIONS EXPLORER ---
+     with tab_explorer:
+@@ -363,7 +370,7 @@
+         dept_list = ["كافة الإدارات"] + sorted(list({j['department'] for j in all_jds if j['department']}))
+         selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list)
+         
+-        status_list = ["كافة الحالات", "مسودة", "قيد المراجعة", "معتمد", "مرفوض"]
++        status_list = ["كافة الحالات", *(status.value for status in CardStatus)]
+         selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list)
+ 
+         filtered_jds = all_jds
+@@ -403,7 +410,7 @@
+             st.download_button(
+                 label=f"📥 تحميل بطاقة '{jd['title']}' كملف Word منسق (.docx)",
+                 data=doc_stream,
+-                file_name=f"{jd['title'].replace(' ', '_')}_بطاقة_وصف_وظيفي.docx",
++                file_name=download_filename(jd),
+                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                 type="primary"
+             )
+@@ -561,7 +568,7 @@
+                 st.rerun()
+             interview_base = st.session_state.setdefault(base_key, {
+                 'status': selected_interview['status'], 'notes': selected_interview['notes']})
+-            statuses = list(dict.fromkeys([selected_interview['status'], "قيد المراجعة", "مكتملة", "مؤجلة", "لم تبدأ"]))
++            statuses = list(dict.fromkeys([selected_interview['status'], *(status.value for status in InterviewStatus)]))
+             with st.form(f"update_interview_form_{chosen_id}"):
+                 new_status = st.selectbox("حالة المقابلة الحالية", statuses, key=f'interview_status_{chosen_id}')
+                 interview_notes = st.text_area("الملاحظات ومخرجات الاجتماع المتفق عليها", value=selected_interview['notes'] or "", key=f'interview_notes_{chosen_id}')
+@@ -843,7 +850,7 @@
+         st.download_button(
+             label=f"📥 تنزيل بطاقة '{jd['title']}' كملف Word (.docx)",
+             data=doc_stream,
+-            file_name=f"{jd['title'].replace(' ', '_')}_بطاقة_وصف_معتمدة.docx",
++            file_name=download_filename(jd),
+             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             type="primary"
+         )
+--- a/backups.py
++++ b/backups.py
+@@ -3,6 +3,8 @@
+ from datetime import datetime, timezone
+ from pathlib import Path
+ import os
++import hashlib
++import hmac
+ import sqlite3
+ import tempfile
+ from threading import Lock
+@@ -21,6 +23,50 @@
+         raise RuntimeError("SQLite integrity verification failed; no migration was performed.")
+     if conn.execute("PRAGMA foreign_key_check").fetchall():
+         raise RuntimeError("Foreign key violations found; no migration was performed.")
++
++
++def checksum_path(path):
++    return Path(str(path) + '.sha256')
++
++
++def sha256_file(path):
++    digest = hashlib.sha256()
++    with Path(path).open('rb') as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def verify_backup_checksum(path, *, required=False):
++    path = Path(path)
++    sidecar = checksum_path(path)
++    if path.is_symlink() or sidecar.is_symlink():
++        raise RuntimeError('Backup artifacts must not be symbolic links.')
++    if not sidecar.exists():
++        if required:
++            raise RuntimeError('Backup checksum is missing.')
++        return False  # Compatibility with pre-Stage-3 backups and raw DB copies.
++    expected = f'{sha256_file(path)}  {path.name}\n'
++    if not hmac.compare_digest(sidecar.read_bytes(), expected.encode('utf-8')):
++        raise RuntimeError('Backup SHA-256 verification failed.')
++    return True
++
++
++def write_backup_checksum(path):
++    path = Path(path)
++    sidecar = checksum_path(path)
++    if sidecar.exists() or sidecar.is_symlink():
++        verify_backup_checksum(path, required=True)
++        return sidecar
++    if path.is_symlink():
++        raise RuntimeError('Backup artifacts must not be symbolic links.')
++    fd = os.open(sidecar, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
++    with os.fdopen(fd, 'wb') as handle:
++        handle.write(f'{sha256_file(path)}  {path.name}\n'.encode('utf-8'))
++        handle.flush()
++        os.fsync(handle.fileno())
++    verify_backup_checksum(path, required=True)
++    return sidecar
+ 
+ 
+ def backup_database(db_path, backup_dir=None):
+@@ -42,6 +88,8 @@
+     try:
+         with closing(readonly_connection(source)) as src, closing(sqlite3.connect(target)) as dst:
+             src.backup(dst)
++            # A backup is a standalone artifact, never dependent on a WAL file.
++            dst.execute('PRAGMA journal_mode=DELETE')
+             verify_database(dst)
+             # Rehearse restore to an independent file; compare complete schema and values.
+             with tempfile.TemporaryDirectory(prefix="restore-", dir=directory) as temp:
+@@ -50,8 +98,10 @@
+                     verify_database(restored)
+                     if list(dst.iterdump()) != list(restored.iterdump()):
+                         raise RuntimeError("Backup restore comparison failed.")
++        write_backup_checksum(target)
+     except BaseException:
+         target.unlink(missing_ok=True)
++        checksum_path(target).unlink(missing_ok=True)
+         raise
+     return target
+ 
+--- a/scripts/restore_database.py
++++ b/scripts/restore_database.py
+@@ -5,11 +5,12 @@
+ from pathlib import Path
+ import sqlite3
+ 
+-from backups import readonly_connection, verify_database
++from backups import readonly_connection, verify_database, verify_backup_checksum
+ 
+ 
+-def restore_database(backup, destination):
++def restore_database(backup, destination, *, require_checksum=False):
+     source = Path(backup).resolve(strict=True)
++    verify_backup_checksum(backup, required=require_checksum)
+     target = Path(destination).resolve()
+     target.parent.mkdir(parents=True, exist_ok=True)
+     # Fail if the destination exists (including the source or a live database).
+@@ -32,5 +33,6 @@
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("backup", type=Path)
+     parser.add_argument("destination", type=Path)
++    parser.add_argument('--require-checksum', action='store_true')
+     args = parser.parse_args()
+-    print(restore_database(args.backup, args.destination))
++    print(restore_database(args.backup, args.destination, require_checksum=args.require_checksum))
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,10 +4,12 @@
+ .pytest_cache/
+ *.db
+ *.db-*
++*.db.sha256
+ *.sqlite*
+ data/backups/
+ _stage1_work/
+ _stage2_work/
++_stage3_work/
+ .env
+ .streamlit/secrets.toml
+ job describation/
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -10,9 +10,11 @@
+ .venv
+ _stage1_work
+ _stage2_work
++_stage3_work
+ data
+ *.db
+ *.db-*
++*.db.sha256
+ *.sqlite*
+ .streamlit/secrets.toml
+ job describation
+--- a/.streamlit/config.toml
++++ b/.streamlit/config.toml
+@@ -10,4 +10,13 @@
+ enableCORS = true
+ enableXsrfProtection = true
+ port = 8501
++maxUploadSize = 10
+ 
++[browser]
++gatherUsageStats = false
++
++[client]
++showErrorDetails = false
++
++[runner]
++magicEnabled = false
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,2 @@
+-streamlit>=1.35.0
+-python-docx>=1.1.0
+-pandas>=2.0.0
+-openpyxl>=3.1.0
+-argon2-cffi==25.1.0
++-r requirements.lock
+ 
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -1,2 +1 @@
+--r requirements.txt
+-pytest==9.1.1
++-r requirements-dev.lock
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -16,9 +16,9 @@
+     && rm -rf /var/lib/apt/lists/*
+ 
+ # Install python dependencies
+-COPY requirements.txt .
+-RUN pip install --no-cache-dir --upgrade pip && \
+-    pip install --no-cache-dir -r requirements.txt
++COPY requirements.txt requirements.lock ./
++RUN pip install --no-cache-dir pip==26.2.1 && \
++    pip install --no-cache-dir -r requirements.lock
+ 
+ # Copy application source code and initial files
+ COPY . .
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,16 +1,14 @@
+ """All writes use disposable synthetic databases, never the business database."""
+ from pathlib import Path
+ import sqlite3
++from contextlib import closing
+ 
+ import pytest
+ import database
+ import governance
+ 
+ 
+-@pytest.fixture
+-def db(monkeypatch, tmp_path):
+-    path = tmp_path / "synthetic.db"
+-    monkeypatch.setattr(database, "DB_PATH", str(path))
++def build_synthetic_database(path):
+     with sqlite3.connect(path) as conn:
+         conn.executescript(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
+         for n in (1, 2):
+@@ -24,6 +22,30 @@
+                          (uid, name, "synthetic-secret", f"مستخدم {uid}", role, assigned))
+         conn.row_factory = sqlite3.Row
+         governance.migrate(conn)
++    return path
++
++
++def pytest_addoption(parser):
++    parser.addoption('--restored-fixture', help='Verified synthetic backup to restore independently for every db fixture.')
++
++
++@pytest.fixture
++def db(monkeypatch, tmp_path, request):
++    path = tmp_path / 'synthetic.db'
++    monkeypatch.setattr(database, 'DB_PATH', str(path))
++    source = request.config.getoption('--restored-fixture')
++    if source:
++        from backups import readonly_connection
++        from scripts.restore_database import restore_database
++        # Explicitly refuse personnel databases, including accidental operator input.
++        with closing(readonly_connection(source)) as conn:
++            users = conn.execute('SELECT id,username,password FROM users ORDER BY id').fetchall()
++            if users != [(1, 'hr', 'synthetic-secret'), (2, 'manager', 'synthetic-secret'),
++                         (3, 'staff', 'synthetic-secret'), (4, 'other', 'synthetic-secret')]:
++                raise ValueError('The recovery test gate requires the synthetic fixture, never a business database.')
++        restore_database(source, path, require_checksum=True)
++    else:
++        build_synthetic_database(path)
+     return path
+ 
+ 
+--- /dev/null
++++ b/statuses.py
+@@ -0,0 +1,74 @@
++"""Workflow domains: canonical Arabic values with explicit legacy compatibility."""
++from enum import StrEnum
++
++
++class WorkflowStatus(StrEnum):
++    @classmethod
++    def parse(cls, value):
++        if isinstance(value, cls):
++            return value
++        if not isinstance(value, str):
++            raise ValueError('حالة سير العمل غير صالحة.')
++        canonical = ALIASES[cls].get(value, value)
++        try:
++            return cls(canonical)
++        except ValueError as exc:
++            raise ValueError('حالة سير العمل غير صالحة.') from exc
++
++
++class CardStatus(WorkflowStatus):
++    DRAFT = 'مسودة'
++    PENDING_REVIEW = 'قيد المراجعة'
++    APPROVED = 'معتمد'
++    REJECTED = 'مرفوض'
++
++
++class ReviewStatus(WorkflowStatus):
++    PENDING = 'قيد الانتظار'
++    ACCEPTED = 'مقبول'
++    REJECTED = 'مرفوض'
++
++
++class InterviewStatus(WorkflowStatus):
++    PENDING_REVIEW = 'قيد المراجعة'
++    COMPLETED = 'مكتملة'
++    POSTPONED = 'مؤجلة'
++    NOT_STARTED = 'لم تبدأ'
++
++
++ALIASES = {
++    CardStatus: dict(zip(('Draft', 'Under Review', 'Pending Review', 'Approved', 'Rejected'),
++                        (CardStatus.DRAFT, CardStatus.PENDING_REVIEW, CardStatus.PENDING_REVIEW,
++                         CardStatus.APPROVED, CardStatus.REJECTED))),
++    ReviewStatus: {'Pending': ReviewStatus.PENDING, 'Accept': ReviewStatus.ACCEPTED,
++                   'Accepted': ReviewStatus.ACCEPTED, 'Reject': ReviewStatus.REJECTED,
++                   'Rejected': ReviewStatus.REJECTED},
++    InterviewStatus: {'Under Review': InterviewStatus.PENDING_REVIEW,
++                      'Pending Review': InterviewStatus.PENDING_REVIEW,
++                      'Completed': InterviewStatus.COMPLETED, 'Postponed': InterviewStatus.POSTPONED,
++                      'Not Started': InterviewStatus.NOT_STARTED},
++}
++for domain, values in ALIASES.items():
++    values.update({member.value: member for member in domain})
++
++
++def display_status(domain, value):
++    """Known legacy values display consistently; unknown history is retained."""
++    try:
++        return domain.parse(value).value
++    except ValueError:
++        return value
++
++
++def install_constraints(conn):
++    """Guard future writes without rewriting immutable/historical legacy rows."""
++    for table, domain in (('job_descriptions', CardStatus), ('modification_requests', ReviewStatus),
++                          ('interview_schedule', InterviewStatus)):
++        allowed = ','.join("'" + v.replace("'", "''") + "'" for v in ALIASES[domain])
++        for action in ('INSERT', 'UPDATE OF status'):
++            suffix = 'insert' if action == 'INSERT' else 'update'
++            changed = '' if suffix == 'insert' else 'NEW.status IS NOT OLD.status AND '
++            conn.execute(f"""CREATE TRIGGER IF NOT EXISTS stage3_{table}_status_{suffix}
++                BEFORE {action} ON {table}
++                WHEN {changed}(NEW.status IS NULL OR NEW.status NOT IN ({allowed}))
++                BEGIN SELECT RAISE(ABORT,'Invalid workflow status'); END""")
+--- /dev/null
++++ b/upload_security.py
+@@ -0,0 +1,108 @@
++"""Bounded DOCX intake and filenames safe for HTML, Windows paths and downloads."""
++import io
++import os
++from pathlib import Path
++import re
++import unicodedata
++from urllib.parse import quote, unquote
++from zipfile import BadZipFile, ZipFile
++
++DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
++
++
++def max_upload_bytes():
++    raw = os.environ.get('JD_MAX_UPLOAD_BYTES', str(DEFAULT_MAX_UPLOAD_BYTES))
++    try:
++        limit = int(raw)
++    except ValueError as exc:
++        raise ValueError('JD_MAX_UPLOAD_BYTES must be a positive integer.') from exc
++    if limit <= 0:
++        raise ValueError('JD_MAX_UPLOAD_BYTES must be a positive integer.')
++    return limit
++
++
++def upload_limit_megabytes():
++    """Widget limit follows the backend setting; the byte check stays exact."""
++    return (max_upload_bytes() + 1024 * 1024 - 1) // (1024 * 1024)
++
++
++def sanitize_docx_filename(name):
++    # Decode encoded separators before removing path components. Never join this
++    # untrusted name to a disk path; the parser consumes an in-memory stream.
++    name = str(name or '')[:4096]
++    for _ in range(3):
++        decoded = unquote(name)
++        if decoded == name:
++            break
++        name = decoded
++    name = unicodedata.normalize('NFKC', name).replace('\\', '/').split('/')[-1]
++    name = re.sub(r'(?i)\.docx$', '', name)
++    safe = ''.join(c if (unicodedata.category(c)[0] in ('L', 'N') or c in ' _-') else '_'
++                   for c in name)
++    safe = re.sub(r'[ _-]+', '_', safe).strip('_')[:100]
++    safe = safe.encode('utf-8')[:180].decode('utf-8', errors='ignore').rstrip('_') or 'document'
++    if safe.upper() in {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}:
++        safe = 'document_' + safe
++    return safe + '.docx'
++
++
++def download_filename(card, *, url_encoded=False):
++    identifier = re.sub('[^A-Za-z0-9_-]', '_', str(card.get('id') or 'new'))[:24]
++    title = sanitize_docx_filename(card.get('title') or 'Job_Description')[:-5]
++    title = title.encode('utf-8')[:120].decode('utf-8', errors='ignore')
++    name = f'3S-JD-{identifier}_{title}_بطاقة_وصف_وظيفي.docx'
++    # Streamlit percent-encodes Unicode in RFC 5987 filename* itself. Give it the
++    # readable name; encode once here only for callers constructing a URL.
++    return quote(name, safe='-_.', encoding='utf-8', errors='strict') if url_encoded else name
++
++
++def validated_docx(source):
++    """Validate before python-docx/lxml sees the archive; return bounded bytes."""
++    limit = max_upload_bytes()
++    if isinstance(source, (str, bytes, os.PathLike)):
++        path = Path(source)
++        if path.stat().st_size > limit:
++            raise ValueError('يتجاوز حجم ملف Word الحد المسموح.')
++        with path.open('rb') as handle:
++            data = handle.read(limit + 1)
++        name = path.name
++    else:
++        name = getattr(source, 'name', 'uploaded_document.docx')
++        claimed_size = getattr(source, 'size', None)
++        if isinstance(claimed_size, int) and claimed_size > limit:
++            raise ValueError('يتجاوز حجم ملف Word الحد المسموح.')
++        original = source.tell()
++        try:
++            source.seek(0)
++            data = source.read(limit + 1)
++        finally:
++            source.seek(original)
++    if not isinstance(data, bytes) or len(data) > limit:
++        raise ValueError('يتجاوز حجم ملف Word الحد المسموح أو أن نوع الملف غير صالح.')
++    if not str(name).lower().endswith('.docx') or not data.startswith(b'PK\x03\x04'):
++        raise ValueError('يجب رفع ملف Word بصيغة DOCX وتوقيع ZIP صحيح.')
++    try:
++        with ZipFile(io.BytesIO(data)) as archive:
++            entries = archive.infolist()
++            names = [item.filename for item in entries]
++            if len(entries) > 2048 or len(names) != len(set(names)):
++                raise ValueError('يحتوي ملف Word على عدد غير مسموح أو مكرر من المكونات.')
++            if not {'[Content_Types].xml', '_rels/.rels', 'word/document.xml'}.issubset(names):
++                raise ValueError('الملف ليس حزمة Word صالحة.')
++            total = 0
++            expanded_limit = max(limit * 5, 5 * 1024 * 1024)
++            for item in entries:
++                parts = item.filename.replace('\\', '/').split('/')
++                if (item.filename.startswith(('/', '\\')) or '..' in parts or ':' in item.filename or
++                        item.flag_bits & 1 or (item.external_attr >> 16) & 0o170000 == 0o120000):
++                    raise ValueError('يحتوي ملف Word على مكونات غير آمنة.')
++                total += item.file_size
++                if total > expanded_limit or item.file_size > expanded_limit:
++                    raise ValueError('حجم مكونات ملف Word بعد فك الضغط غير مسموح.')
++            if archive.testzip() is not None:
++                raise ValueError('أحد مكونات ملف Word تالف.')
++    except (BadZipFile, RuntimeError, NotImplementedError) as exc:
++        raise ValueError('تعذر التحقق من سلامة حزمة Word.') from exc
++    result = io.BytesIO(data)
++    result.name = sanitize_docx_filename(name)
++    return result
+--- /dev/null
++++ b/scripts/backup.py
+@@ -0,0 +1,68 @@
++"""Verified backups with SHA-256 and age/count retention; suitable for a scheduler."""
++import argparse
++from contextlib import closing
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++import re
++
++from backups import (backup_database, checksum_path, readonly_connection, verify_database,
++                     verify_backup_checksum, write_backup_checksum)
++from scripts.migrate_passwords import DEFAULT_DB
++
++
++def rotate_backups(database, directory, *, retention_days=30, keep=5, now=None):
++    if retention_days < 1 or keep < 5:
++        raise ValueError('Retention must be at least one day and keep at least five backups.')
++    now = now or datetime.now(timezone.utc)
++    if now.tzinfo is None:
++        raise ValueError('Retention requires a timezone-aware clock.')
++    root = Path(directory).resolve(strict=True)
++    pattern = re.compile(re.escape(Path(database).stem) + r'_(\d{8}T\d{6}\.\d{6}Z)_[0-9a-f]{8}\.db\Z')
++    candidates = []
++    for item in root.iterdir():
++        match = pattern.fullmatch(item.name)
++        if not match:
++            continue
++        # Validate the final absolute targets before deleting any artifact.
++        if item.is_symlink() or item.resolve().parent != root or not item.is_file():
++            raise RuntimeError('Backup rotation encountered an unsafe path.')
++        sidecar = checksum_path(item)
++        if sidecar.is_symlink() or sidecar.resolve().parent != root:
++            raise RuntimeError('Backup rotation encountered an unsafe checksum path.')
++        stamp = datetime.strptime(match[1], '%Y%m%dT%H%M%S.%fZ').replace(tzinfo=timezone.utc)
++        # Validate and seal managed legacy backups before making retention decisions.
++        verify_backup_checksum(item)
++        with closing(readonly_connection(item)) as conn:
++            verify_database(conn)
++        write_backup_checksum(item)
++        candidates.append((stamp, item))
++    candidates.sort(key=lambda pair: (pair[0], pair[1].name), reverse=True)
++    expired = [item for stamp, item in candidates[keep:] if stamp < now - timedelta(days=retention_days)]
++    for item in expired:
++        if item.is_symlink() or item.resolve().parent != root or checksum_path(item).is_symlink():
++            raise RuntimeError('Backup target changed during rotation.')
++        item.unlink()
++        checksum_path(item).unlink()
++    return expired
++
++
++def run_backup(database=DEFAULT_DB, directory=None, *, retention_days=30, keep=5):
++    directory = Path(directory) if directory else Path(database).resolve().parent / 'data' / 'backups'
++    artifact = backup_database(database, directory)
++    pruned = rotate_backups(database, directory, retention_days=retention_days, keep=keep)
++    return artifact, pruned
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--database', type=Path, default=DEFAULT_DB)
++    parser.add_argument('--backup-dir', type=Path)
++    parser.add_argument('--retention-days', type=int, default=30)
++    parser.add_argument('--keep', type=int, default=5)
++    args = parser.parse_args()
++    artifact, pruned = run_backup(args.database, args.backup_dir, retention_days=args.retention_days, keep=args.keep)
++    print(f'Verified backup: {artifact}; checksum: {checksum_path(artifact)}; pruned: {len(pruned)}')
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/scripts/lock_dependencies.py
+@@ -0,0 +1,64 @@
++"""Pin only the app/test dependency closure, never unrelated host packages."""
++import argparse
++from importlib import metadata
++from pathlib import Path
++
++from packaging.markers import default_environment
++from packaging.requirements import Requirement
++from packaging.utils import canonicalize_name
++
++ROOT = Path(__file__).resolve().parents[1]
++APP_ROOTS = ('streamlit', 'python-docx', 'pandas', 'openpyxl', 'argon2-cffi')
++
++
++def dependency_closure(roots):
++    environments = []
++    for system, platform, python in (('Windows', 'win32', '3.14'), ('Linux', 'linux', '3.11')):
++        env = default_environment() | {'platform_system': system, 'sys_platform': platform,
++                                      'python_version': python, 'python_full_version': python + '.0', 'extra': ''}
++        environments.append(env)
++    pinned, pending = {}, [Requirement(name) for name in roots]
++    while pending:
++        req = pending.pop()
++        name = canonicalize_name(req.name)
++        dist = metadata.distribution(name)
++        if req.specifier and dist.version not in req.specifier:
++            raise RuntimeError(f'Installed {name}=={dist.version} does not satisfy {req.specifier}')
++        if name in pinned:
++            continue
++        pinned[name] = dist.version
++        for raw in dist.requires or ():
++            child = Requirement(raw)
++            if child.marker is None or any(child.marker.evaluate(env) for env in environments):
++                if child.extras:
++                    raise RuntimeError(f'Explicit extra dependency requires review: {raw}')
++                pending.append(child)
++    return dict(sorted(pinned.items()))
++
++
++def lock_text(pins):
++    return ''.join(f'{name}=={version}\n' for name, version in sorted(pins.items()))
++
++
++def generate(check=False):
++    app = dependency_closure(APP_ROOTS)
++    dev = dependency_closure((*APP_ROOTS, 'pytest'))
++    outputs = {
++        ROOT / 'requirements.lock': '# Exact app closure for Python 3.11+ on Windows/Linux; generated by scripts.lock_dependencies.\n' + lock_text(app),
++        ROOT / 'requirements-dev.lock': '# Exact test dependencies in addition to the app lock.\n-r requirements.lock\n' + lock_text({k: v for k, v in dev.items() if k not in app}),
++    }
++    for path, content in outputs.items():
++        if check:
++            if path.read_text(encoding='utf-8') != content:
++                raise RuntimeError(f'{path.name} differs from the tested installed dependency closure.')
++        else:
++            path.write_text(content, encoding='utf-8', newline='\n')
++    return len(app), len(dev)
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--check', action='store_true')
++    args = parser.parse_args()
++    app, dev = generate(args.check)
++    print(f'Exact pins {"verified" if args.check else "generated"}: {app} app packages, {dev} including tests.')
+--- /dev/null
++++ b/scripts/audit_dependencies.py
+@@ -0,0 +1,105 @@
++"""Fail-closed pip consistency, lock-drift and live OSV vulnerability audit."""
++import argparse
++from datetime import datetime, timezone
++from importlib import metadata
++import json
++from pathlib import Path
++import re
++import subprocess
++import sys
++from urllib.request import Request, urlopen
++
++from packaging.utils import canonicalize_name
++from packaging.version import Version
++
++ROOT = Path(__file__).resolve().parents[1]
++if __package__ in (None, ''):
++    sys.path.insert(0, str(ROOT))
++from scripts.lock_dependencies import APP_ROOTS, dependency_closure
++OSV_ENDPOINT = 'https://api.osv.dev/v1/querybatch'
++
++
++def read_lock(path):
++    pins = {}
++    for line in Path(path).read_text(encoding='utf-8').splitlines():
++        line = line.strip()
++        if not line or line.startswith('#'):
++            continue
++        match = re.fullmatch(r'([A-Za-z0-9_.-]+)==([A-Za-z0-9.+!-]+)', line)
++        if not match:
++            raise ValueError('The production lock must contain only exact package==version pins.')
++        name = canonicalize_name(match[1])
++        if name in pins:
++            raise ValueError('Duplicate package in lock.')
++        pins[name] = match[2]
++    if not pins:
++        raise ValueError('Dependency lock is empty.')
++    return pins
++
++
++def query_osv(pins, *, opener=urlopen):
++    packages = sorted(pins.items())
++    results = []
++    for offset in range(0, len(packages), 100):
++        batch = packages[offset:offset + 100]
++        payload = {'queries': [{'package': {'name': name, 'ecosystem': 'PyPI'}, 'version': version}
++                               for name, version in batch]}
++        request = Request(OSV_ENDPOINT, data=json.dumps(payload).encode('utf-8'),
++                          headers={'Content-Type': 'application/json', 'User-Agent': '3S-dependency-audit/1'})
++        with opener(request, timeout=30) as response:
++            result = json.load(response)
++        if not isinstance(result.get('results'), list) or len(result['results']) != len(batch):
++            raise RuntimeError('Incomplete OSV response; audit did not pass.')
++        for (name, version), item in zip(batch, result['results']):
++            if not isinstance(item, dict) or item.get('next_page_token') or item.get('error'):
++                raise RuntimeError('Incomplete/paginated OSV response; audit did not pass.')
++            vulns = item.get('vulns', [])
++            if not isinstance(vulns, list) or any(not isinstance(v, dict) or not v.get('id') for v in vulns):
++                raise RuntimeError('Malformed OSV findings; audit did not pass.')
++            results.extend({'package': name, 'version': version, 'id': vuln['id']} for vuln in vulns)
++    return results
++
++
++def audit(lock=ROOT / 'requirements.lock', *, online=True, runner=subprocess.run, version=metadata.version, query=query_osv,
++          closure=dependency_closure):
++    check = runner([sys.executable, '-m', 'pip', 'check'], capture_output=True, text=True, timeout=120)
++    if check.returncode:
++        raise RuntimeError('pip check failed: ' + (check.stdout + check.stderr).strip())
++    pins = read_lock(lock)
++    for name, expected in pins.items():
++        if version(name) != expected:
++            raise RuntimeError(f'Installed version differs from lock: {name}')
++    # These two upstream Windows advisories remain an offline safety floor.
++    # GHSA-7p48-42j8-8846 fixed in 1.54.0; GHSA-rxff-vr5r-8cj5 fixed in 1.37.0.
++    if 'streamlit' in pins and Version(pins['streamlit']) < Version('1.54.0'):
++        raise RuntimeError('Known insecure Streamlit version; require >=1.54.0.')
++    if 'pillow' in pins and Version(pins['pillow']) < Version('13.0.0'):
++        raise RuntimeError('Known insecure Pillow version; require >=13.0.0.')
++    if pins != closure(APP_ROOTS):
++        raise RuntimeError('Lock does not match the complete application dependency closure.')
++    findings = query(pins) if online else []
++    report = {'checked_at_utc': datetime.now(timezone.utc).isoformat(), 'pip_check': 'passed',
++              'package_count': len(pins), 'source': OSV_ENDPOINT if online else 'offline minimum-version floor only',
++              'online_complete': online, 'findings': findings}
++    return report
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--lock', type=Path, default=ROOT / 'requirements.lock')
++    parser.add_argument('--report', type=Path)
++    parser.add_argument('--offline', action='store_true', help='Limited offline floor check; does not establish a CVE-free dependency set.')
++    args = parser.parse_args()
++    try:
++        report = audit(args.lock, online=not args.offline)
++    except Exception as exc:
++        print(f'Dependency audit failed: {exc}', file=sys.stderr)
++        return 2
++    if args.report:
++        args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
++    print(json.dumps(report, indent=2))
++    return 1 if report['findings'] else 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+--- /dev/null
++++ b/requirements.lock
+@@ -0,0 +1,44 @@
++# Exact app closure for Python 3.11+ on Windows/Linux; generated by scripts.lock_dependencies.
++altair==6.3.0
++anyio==4.15.1
++argon2-cffi==25.1.0
++argon2-cffi-bindings==26.1.0
++attrs==26.1.0
++certifi==2026.10.23
++cffi==2.1.0
++charset-normalizer==3.5.2
++click==8.5.0
++et-xmlfile==2.0.0
++h11==0.16.0
++idna==3.20
++itsdangerous==2.2.0
++jinja2==3.1.6
++jsonschema==4.26.0
++jsonschema-specifications==2025.9.1
++lxml==6.1.1
++markupsafe==3.0.4
++narwhals==2.28.0
++numpy==2.4.4
++openpyxl==3.1.5
++packaging==26.2
++pandas==3.0.3
++pillow==13.0.0
++protobuf==7.36.2
++pyarrow==26.0.0
++pycparser==3.12
++pydeck==0.9.3
++python-dateutil==2.9.0.post0
++python-docx==1.2.0
++python-multipart==0.0.32
++referencing==0.37.0
++requests==2.34.2
++rpds-py==2026.9.1
++six==1.17.0
++starlette==1.7.0
++streamlit==1.66.1
++typing-extensions==4.16.0
++tzdata==2026.2
++urllib3==2.8.0
++uvicorn==0.54.0
++watchdog==6.0.0
++websockets==17.3
+--- /dev/null
++++ b/requirements-dev.lock
+@@ -0,0 +1,7 @@
++# Exact test dependencies in addition to the app lock.
++-r requirements.lock
++colorama==0.4.6
++iniconfig==2.3.1
++pluggy==1.7.0
++pygments==2.20.0
++pytest==9.1.1
+--- /dev/null
++++ b/tests/test_stage3_database.py
+@@ -0,0 +1,107 @@
++"""Connection durability, active FK enforcement and status domain tests."""
++from contextlib import closing
++import sqlite3
++
++import pytest
++
++import database
++from statuses import CardStatus, ReviewStatus, InterviewStatus, ALIASES
++
++
++def test_every_factory_connection_has_required_pragmas(db):
++    for _ in range(3):
++        with closing(database.get_connection()) as conn:
++            assert conn.execute('PRAGMA foreign_keys').fetchone()[0] == 1
++            assert conn.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
++            assert conn.execute('PRAGMA synchronous').fetchone()[0] == 1
++
++
++def test_wal_reader_snapshot_does_not_block_writer(db):
++    with closing(database.get_connection()) as reader, closing(database.get_connection()) as writer:
++        reader.execute('BEGIN')
++        original = reader.execute('SELECT purpose FROM job_descriptions WHERE id=1').fetchone()[0]
++        with writer:
++            writer.execute("UPDATE job_descriptions SET purpose='كتابة متزامنة' WHERE id=1")
++        assert reader.execute('SELECT purpose FROM job_descriptions WHERE id=1').fetchone()[0] == original
++        reader.commit()
++        assert reader.execute('SELECT purpose FROM job_descriptions WHERE id=1').fetchone()[0] == 'كتابة متزامنة'
++
++
++@pytest.mark.parametrize('statement', [
++    "INSERT INTO accountabilities(jd_id,item_order,description) VALUES(999,1,'أصل غير موجود')",
++    "INSERT INTO modification_requests(jd_id,section_name,proposed_text,justification,requested_by) VALUES(999,'Job Purpose','جديد','سبب','مستخدم')",
++    "INSERT INTO jd_audit_trail(jd_id,action,changed_by) VALUES(999,'قرار','مستخدم')",
++])
++def test_orphan_inserts_raise_foreign_key_errors_and_rollback(db, statement):
++    with closing(database.get_connection()) as conn:
++        with pytest.raises(sqlite3.IntegrityError, match='FOREIGN KEY'):
++            with conn:
++                conn.execute("UPDATE job_descriptions SET purpose='يجب التراجع' WHERE id=1")
++                conn.execute(statement)
++        assert conn.execute('SELECT purpose,version FROM job_descriptions WHERE id=1').fetchone()[:] == ('هدف أصلي', 1)
++        assert not conn.execute('PRAGMA foreign_key_check').fetchall()
++
++
++def test_failed_pragma_initialization_closes_connection(monkeypatch):
++    class Connection:
++        closed = False
++        def execute(self, sql):
++            if 'journal_mode' in sql:
++                raise sqlite3.OperationalError('synthetic WAL failure')
++        def close(self):
++            self.closed = True
++    conn = Connection()
++    monkeypatch.setattr(database.sqlite3, 'connect', lambda path: conn)
++    with pytest.raises(sqlite3.OperationalError):
++        database.get_connection()
++    assert conn.closed
++
++
++@pytest.mark.parametrize('domain', [CardStatus, ReviewStatus, InterviewStatus])
++def test_status_enum_aliases_and_unknown_values(domain):
++    for alias, canonical in ALIASES[domain].items():
++        assert domain.parse(alias) is canonical
++        assert domain.parse(canonical.value) is canonical
++    for invalid in ('unknown', '<script>', None, 0):
++        with pytest.raises(ValueError):
++            domain.parse(invalid)
++
++
++@pytest.mark.parametrize('table,statement', [
++    ('job_descriptions', "INSERT INTO job_descriptions(title,status) VALUES('اختبار',?)"),
++    ('modification_requests', "INSERT INTO modification_requests(jd_id,section_name,proposed_text,justification,requested_by,status) VALUES(1,'Job Purpose','نص','سبب','مستخدم',?)"),
++    ('interview_schedule', "INSERT INTO interview_schedule(department,manager_name,status) VALUES('إدارة','مدير',?)"),
++])
++def test_status_domains_enforced_at_sql_boundary(db, table, statement):
++    with closing(database.get_connection()) as conn:
++        for invalid in ('invalid', None):
++            with pytest.raises(sqlite3.IntegrityError):
++                conn.execute(statement, (invalid,))
++
++
++def test_interview_alias_writes_canonical_and_invalid_status_is_atomic(sign_in, db):
++    sign_in('hr')
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO interview_schedule(id,department,manager_name,status,notes) VALUES(1,'إدارة','مدير','Completed','مخرجات')")
++    assert database.get_interview_schedule()[0]['status'] == InterviewStatus.COMPLETED
++    database.update_interview_status(1, InterviewStatus.POSTPONED, actor_id=1)
++    with pytest.raises(ValueError):
++        database.update_interview_status(1, 'invalid', 'حذف غير مسموح', actor_id=1)
++    with sqlite3.connect(db) as conn:
++        assert conn.execute('SELECT status,notes FROM interview_schedule').fetchone() == ('مؤجلة', 'مخرجات')
++
++
++def test_legacy_completed_review_displays_canonically_without_rewriting_history(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO modification_requests(jd_id,section_name,proposed_text,justification,requested_by,status) VALUES(1,'Job Purpose','نص','سبب','قديم','Accepted')")
++    assert database.get_requests_by_user('قديم')[0]['status'] == ReviewStatus.ACCEPTED
++    with sqlite3.connect(db) as conn:
++        assert conn.execute('SELECT status FROM modification_requests').fetchone()[0] == 'Accepted'
++
++
++def test_dashboard_counts_only_pending_review_cards(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(title,status) VALUES('مسودة','Draft')")
++        conn.execute("INSERT INTO job_descriptions(title,status) VALUES('مرفوضة','Rejected')")
++    stats = database.get_dashboard_stats()
++    assert stats['total_jds'] == 4 and stats['under_review'] == 2
+--- /dev/null
++++ b/tests/test_stage3_uploads.py
+@@ -0,0 +1,141 @@
++"""Bounded intake, filename handling and existing Arabic Word fidelity."""
++import io
++from urllib.parse import unquote
++from zipfile import ZipFile, ZIP_DEFLATED
++
++import docx
++import pytest
++
++import database
++from docx_parser import parse_jd_docx
++from upload_security import (DEFAULT_MAX_UPLOAD_BYTES, download_filename, max_upload_bytes,
++                             sanitize_docx_filename, validated_docx, upload_limit_megabytes)
++
++
++def document(name='اختبار.docx'):
++    file = io.BytesIO()
++    doc = docx.Document()
++    doc.add_paragraph('نص عربي محفوظ')
++    doc.save(file)
++    file.name = name
++    file.seek(0)
++    return file
++
++
++def test_default_and_configured_size_limits(monkeypatch):
++    monkeypatch.delenv('JD_MAX_UPLOAD_BYTES', raising=False)
++    assert max_upload_bytes() == DEFAULT_MAX_UPLOAD_BYTES
++    file = document()
++    length = len(file.getvalue())
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', str(length))
++    assert validated_docx(file).getvalue() == file.getvalue()
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', str(length - 1))
++    with pytest.raises(ValueError):
++        parse_jd_docx(file)
++
++
++@pytest.mark.parametrize('limit', ['0', '-1', 'bad', '10.5'])
++def test_invalid_limit_fails_closed(monkeypatch, limit):
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', limit)
++    with pytest.raises(ValueError):
++        validated_docx(document())
++
++
++def test_widget_limit_tracks_byte_configuration_with_safe_rounding(monkeypatch):
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', str(20 * 1024 * 1024))
++    assert upload_limit_megabytes() == 20
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', str(1024 * 1024 + 1))
++    assert upload_limit_megabytes() == 2
++
++
++def test_claimed_size_rejected_before_reading():
++    class Upload:
++        name = 'large.docx'
++        size = DEFAULT_MAX_UPLOAD_BYTES + 1
++        def read(self, *args):
++            pytest.fail('Oversized upload must be rejected before reading')
++    with pytest.raises(ValueError):
++        validated_docx(Upload())
++
++
++@pytest.mark.parametrize('data,name', [(b'<script>bad</script>', 'x.docx'), (b'PK\x03\x04not-a-zip', 'x.docx'),
++                                       (b'plain text', 'x.docx'), (b'PK\x03\x04', 'x.exe')])
++def test_extension_and_zip_magic_are_not_sufficient(data, name):
++    file = io.BytesIO(data)
++    file.name = name
++    with pytest.raises(ValueError):
++        parse_jd_docx(file)
++
++
++@pytest.mark.parametrize('entry', ['../../escape.xml', '/absolute.xml', 'C:/escape.xml', 'word/../escape.xml'])
++def test_archive_path_traversal_rejected(entry):
++    file = document()
++    with ZipFile(file, 'a') as archive:
++        archive.writestr(entry, '<xml/>')
++    with pytest.raises(ValueError):
++        validated_docx(file)
++
++
++def test_generic_zip_and_zip_expansion_bomb_rejected(monkeypatch):
++    generic = io.BytesIO()
++    with ZipFile(generic, 'w') as archive:
++        archive.writestr('readme.txt', 'unrelated')
++    with pytest.raises(ValueError):
++        validated_docx(generic)
++    bomb = document()
++    with ZipFile(bomb, 'a', compression=ZIP_DEFLATED) as archive:
++        archive.writestr('word/bomb.xml', 'x' * (6 * 1024 * 1024))
++    monkeypatch.setenv('JD_MAX_UPLOAD_BYTES', '100000')
++    validated_docx(document())
++    with pytest.raises(ValueError):
++        validated_docx(bomb)
++
++
++def test_duplicate_zip_entries_rejected():
++    file = document()
++    with ZipFile(file, 'a') as archive:
++        with pytest.warns(UserWarning, match='Duplicate'):
++            archive.writestr('word/document.xml', 'duplicate')
++    with pytest.raises(ValueError):
++        validated_docx(file)
++
++
++@pytest.mark.parametrize('name', ['../../بطاقة.docx', '..\\..\\card.docx', '%2e%2e%2fcard.docx',
++                                 '%252e%252e%252fcard.docx', '<script>alert(1)</script>.docx',
++                                 'evil\r\nX-Header:yes.docx', 'CON.docx', '\u202eevil.docx'])
++def test_uploaded_names_are_safe_and_keep_docx_extension(name):
++    safe = sanitize_docx_filename(name)
++    assert safe.endswith('.docx')
++    assert not any(char in safe for char in '/\\<>:\r\n%\u202e')
++    assert '..' not in safe and safe != 'CON.docx'
++
++
++def test_valid_arabic_input_keeps_text_and_stream_position():
++    file = document('../../مدير الموارد البشرية.docx')
++    file.seek(8)
++    parsed = parse_jd_docx(file)
++    assert file.tell() == 8
++    assert parsed['file_name'] == 'مدير_الموارد_البشرية.docx'
++    assert parsed['purpose'] == 'نص عربي محفوظ'
++
++
++def test_filename_based_legacy_title_remains_readable_after_sanitizing():
++    parsed = parse_jd_docx(document('../../JD - مدير مالي.docx'))
++    assert parsed['title'] == 'مدير مالي'
++    assert parsed['purpose'] == 'نص عربي محفوظ'
++
++
++def test_safe_download_has_stable_identifier_and_one_url_encoding_layer():
++    card = {'id': 26, 'title': '../../مدير <script>\r\n'}
++    plain = download_filename(card)
++    encoded = download_filename(card, url_encoded=True)
++    assert plain.startswith('3S-JD-26_') and 'بطاقة_وصف_وظيفي' in plain
++    assert not any(c in plain for c in '/\\<>:\r\n')
++    assert unquote(encoded) == plain and encoded.isascii() and '%D8' in encoded
++    assert '%25D8' not in encoded
++
++
++def test_backend_sanitizes_import_provenance_even_without_ui(sign_in, db):
++    sign_in('hr')
++    jd_id = database.create_or_update_jd({'title': 'بطاقة اختبار'}, '../../evil<script>.docx', actor_id=1)
++    assert database.get_jd_by_id(jd_id)['source_file'] == 'evil_script.docx'
+--- /dev/null
++++ b/tests/test_stage3_backups.py
+@@ -0,0 +1,147 @@
++"""Checksummed snapshots, conservative retention, WAL recovery and rollback."""
++from contextlib import closing
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++import sqlite3
++
++import pytest
++
++import backups
++import database
++from scripts.backup import rotate_backups, run_backup
++from scripts.restore_database import restore_database
++
++
++def dump(path):
++    with closing(backups.readonly_connection(path)) as conn:
++        return list(conn.iterdump())
++
++
++def test_backup_checksum_and_verified_restore_are_exact(db, tmp_path):
++    artifact = backups.backup_database(db, tmp_path / 'backups')
++    assert backups.verify_backup_checksum(artifact, required=True)
++    assert backups.checksum_path(artifact).read_text(encoding='utf-8').startswith(backups.sha256_file(artifact))
++    restored = restore_database(artifact, tmp_path / 'restored.db', require_checksum=True)
++    assert dump(restored) == dump(db)
++    with closing(backups.readonly_connection(restored)) as conn:
++        backups.verify_database(conn)
++
++
++def test_backup_captures_committed_wal_without_checkpoint(db, tmp_path):
++    with closing(database.get_connection()) as writer:
++        writer.execute('PRAGMA wal_autocheckpoint=0')
++        with writer:
++            writer.execute("UPDATE job_descriptions SET purpose='محتوى WAL' WHERE id=1")
++        assert Path(str(db) + '-wal').stat().st_size > 0
++        artifact = backups.backup_database(db, tmp_path / 'backups')
++        with closing(backups.readonly_connection(artifact)) as copy:
++            assert copy.execute('SELECT purpose FROM job_descriptions WHERE id=1').fetchone()[0] == 'محتوى WAL'
++        assert not Path(str(artifact) + '-wal').exists()
++        assert backups.verify_backup_checksum(artifact, required=True)
++
++
++@pytest.mark.parametrize('tamper', ['database', 'checksum', 'missing'])
++def test_strict_restore_rejects_tampered_or_missing_checksums(db, tmp_path, tamper):
++    artifact = backups.backup_database(db, tmp_path / 'backups')
++    if tamper == 'database':
++        with artifact.open('ab') as handle:
++            handle.write(b'tampered')
++    elif tamper == 'checksum':
++        backups.checksum_path(artifact).write_text('0' * 64, encoding='utf-8')
++    else:
++        backups.checksum_path(artifact).unlink()
++    destination = tmp_path / 'never-created.db'
++    with pytest.raises(RuntimeError):
++        restore_database(artifact, destination, require_checksum=True)
++    assert not destination.exists()
++
++
++def managed_fixture(source, folder, stamp, number):
++    folder.mkdir(exist_ok=True)
++    name = f'{source.stem}_{stamp:%Y%m%dT%H%M%S.%fZ}_{number:08x}.db'
++    target = folder / name
++    with closing(backups.readonly_connection(source)) as src, closing(sqlite3.connect(target)) as dst:
++        src.backup(dst)
++    backups.write_backup_checksum(target)
++    return target
++
++
++def test_rotation_prunes_only_expired_managed_backups_and_keeps_five(db, tmp_path):
++    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
++    folder = tmp_path / 'backups'
++    old = [managed_fixture(db, folder, now - timedelta(days=40 + n), n) for n in range(7)]
++    new = [managed_fixture(db, folder, now - timedelta(days=n), n + 100) for n in range(2)]
++    unrelated = folder / 'other-project.db'
++    unrelated.write_bytes(b'must be retained')
++    pruned = rotate_backups(db, folder, now=now)
++    assert set(pruned) == set(old[3:])
++    assert all(p.exists() for p in old[:3] + new)
++    assert all(not p.exists() and not backups.checksum_path(p).exists() for p in pruned)
++    assert unrelated.read_bytes() == b'must be retained'
++
++
++def test_retention_boundary_and_minimum_five_even_if_all_expired(db, tmp_path):
++    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
++    folder = tmp_path / 'backups'
++    recent = [managed_fixture(db, folder, now - timedelta(days=n), n) for n in range(5)]
++    boundary = managed_fixture(db, folder, now - timedelta(days=30), 80)
++    assert rotate_backups(db, folder, now=now) == []
++    assert rotate_backups(db, folder, now=now + timedelta(seconds=1)) == [boundary]
++    assert rotate_backups(db, folder, now=now + timedelta(days=400)) == []
++    assert all(p.exists() for p in recent)
++
++
++def test_legacy_backups_are_verified_and_sealed_before_rotation(db, tmp_path):
++    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
++    artifact = managed_fixture(db, tmp_path / 'backups', now, 1)
++    backups.checksum_path(artifact).unlink()
++    assert rotate_backups(db, artifact.parent, now=now) == []
++    assert backups.verify_backup_checksum(artifact, required=True)
++
++
++def test_bad_candidate_aborts_rotation_before_any_deletion(db, tmp_path):
++    now = datetime(2026, 10, 30, tzinfo=timezone.utc)
++    old = [managed_fixture(db, tmp_path / 'backups', now - timedelta(days=100 + n), n) for n in range(6)]
++    backups.checksum_path(old[2]).write_text('corrupt', encoding='utf-8')
++    with pytest.raises(RuntimeError):
++        rotate_backups(db, old[0].parent, now=now)
++    assert all(p.exists() for p in old)
++
++
++def test_backup_failure_does_not_start_rotation(db, monkeypatch, tmp_path):
++    import scripts.backup as command
++    def fail(*args):
++        raise OSError('synthetic disk failure')
++    monkeypatch.setattr(command, 'backup_database', fail)
++    monkeypatch.setattr(command, 'rotate_backups', lambda *args, **kwargs: pytest.fail('Must not prune without a new verified snapshot'))
++    with pytest.raises(OSError):
++        run_backup(db, tmp_path / 'backups')
++
++
++def test_checksum_write_failure_removes_incomplete_new_artifact(db, monkeypatch, tmp_path):
++    def fail(*args):
++        raise OSError('synthetic checksum failure')
++    monkeypatch.setattr(backups, 'write_backup_checksum', fail)
++    folder = tmp_path / 'backups'
++    with pytest.raises(OSError):
++        backups.backup_database(db, folder)
++    assert list(folder.iterdir()) == []
++
++
++@pytest.mark.parametrize('days,keep', [(0, 5), (30, 4)])
++def test_invalid_retention_cannot_remove_backups(tmp_path, days, keep):
++    with pytest.raises(ValueError):
++        rotate_backups('synthetic.db', tmp_path, retention_days=days, keep=keep)
++
++
++def test_restored_backup_retains_decision_snapshots_and_replay_guard(sign_in, db, tmp_path, monkeypatch):
++    sign_in()
++    database.approve_jd_as_is(1, actor_id=2)
++    before = database.get_decision_evidence(1)
++    artifact = backups.backup_database(db, tmp_path / 'backups')
++    restored = restore_database(artifact, tmp_path / 'restored.db', require_checksum=True)
++    monkeypatch.setattr(database, 'DB_PATH', str(restored))
++    assert database.get_decision_evidence(1) == before
++    assert database.get_approval_metadata(1)['version'] == 1
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(1, actor_id=2)
+--- /dev/null
++++ b/tests/test_stage3_operations.py
+@@ -0,0 +1,109 @@
++"""Production configuration, exact locks and fail-closed advisory checks."""
++import io
++import json
++from pathlib import Path
++from types import SimpleNamespace
++import tomllib
++
++import pytest
++
++from scripts import audit_dependencies as audit
++from scripts.lock_dependencies import APP_ROOTS, dependency_closure, generate
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def test_production_configuration_masks_errors_and_preserves_origin_protection():
++    config = tomllib.loads((ROOT / '.streamlit/config.toml').read_text(encoding='utf-8'))
++    assert config['browser']['gatherUsageStats'] is False
++    assert config['client']['showErrorDetails'] is False
++    assert config['server']['enableCORS'] is True and config['server']['enableXsrfProtection'] is True
++    assert config['server']['maxUploadSize'] == 10
++    assert config['runner']['magicEnabled'] is False
++
++
++def test_lock_is_exact_complete_and_excludes_unrelated_host_packages():
++    pins = audit.read_lock(ROOT / 'requirements.lock')
++    assert pins == dependency_closure(APP_ROOTS)
++    assert pins['pillow'] == '13.0.0' and pins['streamlit'] == '1.66.1'
++    assert 'pywin32' not in pins and 'weasyprint' not in pins
++    generate(check=True)
++    docker = (ROOT / 'Dockerfile').read_text(encoding='utf-8')
++    assert '-r requirements.lock' in docker and '--upgrade pip' not in docker
++
++
++@pytest.mark.parametrize('line', ['streamlit>=1.35', 'streamlit', 'streamlit==1.66.1\nstreamlit==1.66.1', '-r requirements.txt', ''])
++def test_incomplete_or_nonexact_lock_rejected(tmp_path, line):
++    path = tmp_path / 'bad.lock'
++    path.write_text(line, encoding='utf-8')
++    with pytest.raises(ValueError):
++        audit.read_lock(path)
++
++
++def runner_ok(*args, **kwargs):
++    assert args[0][-3:] == ['-m', 'pip', 'check']
++    return SimpleNamespace(returncode=0, stdout='No broken requirements found.', stderr='')
++
++
++def test_audit_runs_pip_and_full_online_scan():
++    called = []
++    def query(pins):
++        called.append(pins)
++        return []
++    report = audit.audit(runner=runner_ok, query=query)
++    assert report['pip_check'] == 'passed' and report['online_complete']
++    assert report['package_count'] == len(called[0]) == 43 and report['findings'] == []
++
++
++def test_audit_reports_vulnerabilities_instead_of_suppressing_them():
++    finding = {'package': 'pillow', 'version': '13.0.0', 'id': 'SYNTHETIC-ADVISORY'}
++    report = audit.audit(runner=runner_ok, query=lambda pins: [finding])
++    assert report['findings'] == [finding]
++
++
++def test_pip_failure_prevents_advisory_success():
++    with pytest.raises(RuntimeError, match='pip check failed'):
++        audit.audit(runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout='broken', stderr=''))
++
++
++def test_lock_drift_and_missing_closure_fail():
++    with pytest.raises(RuntimeError, match='differs from lock'):
++        audit.audit(runner=runner_ok, version=lambda name: '0')
++    with pytest.raises(RuntimeError, match='complete application'):
++        audit.audit(runner=runner_ok, closure=lambda roots: {})
++
++
++@pytest.mark.parametrize('package,version', [('streamlit', '1.53.0'), ('pillow', '12.3.0')])
++def test_known_insecure_floor_detected_offline(tmp_path, package, version):
++    lock = tmp_path / 'unsafe.lock'
++    lock.write_text(f'{package}=={version}\n', encoding='utf-8')
++    with pytest.raises(RuntimeError, match='Known insecure'):
++        audit.audit(lock, online=False, runner=runner_ok, version=lambda name: version)
++
++
++def test_offline_result_is_explicitly_partial():
++    report = audit.audit(online=False, runner=runner_ok, query=lambda p: pytest.fail('Offline should not call network'))
++    assert not report['online_complete'] and 'offline' in report['source']
++
++
++def test_osv_payload_contains_only_package_versions():
++    def opener(request, timeout):
++        body = json.loads(request.data)
++        assert body == {'queries': [{'package': {'name': 'pillow', 'ecosystem': 'PyPI'}, 'version': '13.0.0'}]}
++        assert timeout == 30 and request.full_url == audit.OSV_ENDPOINT
++        return io.BytesIO(b'{"results":[{}]}')
++    assert audit.query_osv({'pillow': '13.0.0'}, opener=opener) == []
++
++
++@pytest.mark.parametrize('response', [b'{}', b'{"results":[]}', b'{"results":[{"error":"unavailable"}]}',
++                                    b'{"results":[{"next_page_token":"more"}]}', b'{"results":[{"vulns":[{}]}]}'])
++def test_osv_partial_or_malformed_responses_never_pass(response):
++    with pytest.raises(RuntimeError):
++        audit.query_osv({'pillow': '13.0.0'}, opener=lambda *a, **k: io.BytesIO(response))
++
++
++def test_network_failure_is_audit_failure():
++    def unavailable(*args, **kwargs):
++        raise OSError('network unavailable')
++    with pytest.raises(OSError):
++        audit.audit(runner=runner_ok, query=unavailable)
+--- /dev/null
++++ b/docs/STAGE3_PRODUCTION.md
+@@ -0,0 +1,136 @@
++# Stage 3 production hardening
++
++Implemented and verified on 30 October 2026. This stage preserves the Python, Streamlit, python-docx and SQLite stack and extends the Stage 1/2 controls without rebuilding tables or rewriting historical records.
++
++## Changes by file
++
++| Files | Result |
++|---|---|
++| `database.py` | Every application connection immediately sets foreign keys ON, journal mode WAL and synchronous NORMAL. Failed initialization closes the connection. Workflow writes validate shared status domains; known legacy review/interview labels display consistently. Dashboard pending counts exclude drafts/rejections. New import provenance is sanitized at the backend boundary. |
++| `statuses.py`; `governance.py` | Explicit `CardStatus`, `ReviewStatus`, `InterviewStatus` Enums with canonical Arabic values and documented English aliases. Additive insert/update guards reject unknown/null future statuses. Stage 2 transition, revision and immutable-evidence guards remain in force. Existing stored aliases, IDs and historical snapshots are preserved. |
++| `upload_security.py`; `docx_parser.py` | Configurable byte limit, default 10 MiB; bounded reads; required `PK\x03\x04` signature and DOCX extension; ZIP component/CRC validation; required Word parts; rejection of duplicate entries, traversal/absolute paths, encrypted/symlink entries and excessive expansion. Parsing errors return safe messages. Legacy filename-based titles remain readable. |
++| `app.py` | Safe upload previews, widget keys and stored filenames; expected import failures show controlled messages and unexpected failures are masked. The upload widget follows the configured byte threshold, rounded up to MiB; the parser enforces the exact byte boundary. Downloads retain `3S-JD-<ID>`, a sanitized title and an Arabic document label. |
++| `.streamlit/config.toml` | Telemetry disabled; error details disabled; CORS/XSRF enabled; default upload limit 10 MiB. Unused Streamlit magic is disabled after the regression gate exposed a Python 3.14 AST compilation failure in that feature. All application rendering uses explicit Streamlit calls. |
++| `requirements.lock`; `requirements-dev.lock`; `requirements.txt`; `requirements-dev.txt`; `scripts/lock_dependencies.py` | Exact versions for the complete tested dependency closure: 43 production packages, 48 including tests. Unrelated host tools are excluded. Regeneration/check commands detect drift. |
++| `scripts/audit_dependencies.py` | Runs `pip check`, checks installed versions and dependency-closure completeness, checks known insecure minimum versions, then queries the live OSV API for every production pin. Findings cause exit 1; unavailable/malformed/incomplete advisory responses and other failures cause exit 2. Offline mode is explicitly a limited check. |
++| `Dockerfile` | Installs the production lock and an exact pip version instead of resolving minimum-only application dependencies or floating the installer. The Python 3.11 image target is retained. |
++| `backups.py`; `scripts/backup.py`; `scripts/restore_database.py` | Every new backup gets a verified SHA-256 sidecar. Backups use the SQLite backup API, include committed WAL data and are independent of WAL sidecars. Scheduled backup runs validate/seal managed legacy backups and prune expired artifacts while retaining at least five. Restore checks available hashes before creating its target; strict checksum mode is available. |
++| `tests/conftest.py`; four `tests/test_stage3_*.py` files | 79 new cases. A recovery gate can restore a verified synthetic backup independently for every database fixture; it refuses personnel-account inputs. All 107 original cases retain their assertions. |
++| `.gitignore`; `.dockerignore` | Exclude Stage 3 work, private recovery copies and database checksum artifacts from source/build delivery. |
++
++## SQLite and statuses
++
++`database.get_connection()` executes these PRAGMAs before returning a connection:
++
++```sql
++PRAGMA foreign_keys = ON;
++PRAGMA journal_mode = WAL;
++PRAGMA synchronous = NORMAL;
++```
++
++The factory requires a file-backed database supporting WAL. NORMAL appears as `1` when read back. Foreign keys are connection-local; tests prove orphan responsibilities, modification requests and audit events raise `sqlite3.IntegrityError` and roll back the surrounding transaction. A concurrent reader test proves WAL readers retain their snapshot while another connection commits.
++
++| Domain | Canonical values |
++|---|---|
++| Card | `مسودة`, `قيد المراجعة`, `معتمد`, `مرفوض` |
++| Review request | `قيد الانتظار`, `مقبول`, `مرفوض` |
++| Interview | `قيد المراجعة`, `مكتملة`, `مؤجلة`, `لم تبدأ` |
++
++English aliases are explicit in `statuses.ALIASES`. New public workflow writes validate these domains and write canonical values. Database guards also reject invalid future inserts/status changes. Existing aliases are not bulk-normalized: the historical `Accepted` request stays exactly as stored, while its UI label is `مقبول`. Unknown historical values remain available for explicit correction rather than being guessed. Historical decision snapshots and hashes are never rewritten.
++
++Normal startup applies the additive guards after its verified pre-startup backup. Existing Stage 2 optimistic concurrency, authority checks and immutable decision evidence remain unchanged.
++
++## Uploads and document downloads
++
++Set `JD_MAX_UPLOAD_BYTES` to a positive integer to change the per-document byte threshold. For example:
++
++```powershell
++$env:JD_MAX_UPLOAD_BYTES = '10485760'
++```
++
++The default is 10,485,760 bytes. The widget derives its MiB limit from the same setting. Reads stop after the configured limit plus one byte, and oversized claimed sizes are rejected before reading. Archive expansion is capped at five times the configured upload allowance, with a 5 MiB minimum expansion budget for small valid OOXML documents. Archives may contain at most 2,048 unique entries. No archive member is extracted to a filesystem path.
++
++Filenames are normalized and stripped of path components, encoded separators, controls, markup and Windows reserved basenames. Arabic/English letters are retained and names end in `.docx`. This changes transport/provenance names, not document content. All 26 supplied Word sources were compared with the Stage 2 parser: every content field remains identical, including the legacy document whose title comes from its filename.
++
++Downloads pass a sanitized readable Unicode name to Streamlit, which generates the UTF-8 percent-encoded RFC 5987 `filename*` header. This avoids saving literal double-encoded percent sequences as the filename. `download_filename(..., url_encoded=True)` supplies the explicit encoded form for URL-building callers. IDs and the Arabic document label remain present even when a title contains separators or markup. Existing Arabic content, RTL/table layout and v2 DOCX round-trip regressions pass.
++
++## Dependencies and deployment
++
++The live audit initially found advisories affecting Pillow 12.3.0. Pillow was upgraded **inside the project virtual environment** to **13.0.0**, the upstream fixed version allowed by Streamlit's range. Other application dependencies retained their tested versions. The final live OSV audit at **2026-10-30 09:42:57 UTC** checked all **43** production pins and returned **zero findings**. This is a dated advisory result, not a guarantee against future disclosures.
++
++Install the matching lock for the intended environment:
++
++```powershell
++# Production
++.\.venv\Scripts\python -m pip install -r requirements.lock
++
++# Development and synthetic testing
++.\.venv\Scripts\python -m pip install -r requirements-dev.lock
++
++.\.venv\Scripts\python -B -m scripts.lock_dependencies --check
++.\.venv\Scripts\python -B -m scripts.audit_dependencies
++.\.venv\Scripts\python -m pip check
++```
++
++Locks use exact versions, as permitted by the stage requirements; they do not contain wheel hashes. `scripts.lock_dependencies` generates the app/test closures from installed distribution metadata, evaluating the Windows/Python 3.14 and Linux/Python 3.11 targets. Review and audit intended upgrades before regenerating a lock. An offline audit must be requested explicitly with `--offline`; it checks consistency, drift and known Streamlit/Pillow floors but does not replace the live vulnerability scan.
++
++Binary-only resolution of the complete production lock succeeded for **CPython 3.11 on Linux x86-64**, matching the container target. The local test runtime is Windows/Python 3.14.5. Docker is unavailable here, so no container build or running-container/proxy validation is claimed.
++
++Run one writable application instance against a durable local SQLite directory. `JD_DB_PATH` selects the database file; mount/protect the containing directory so SQLite can maintain its WAL/SHM files. Deploy the supplied CORS/XSRF settings without disabling them at the proxy. Start the portal with the same virtual environment used for the lock and checks.
++
++## Backup rotation and recovery
++
++Use this scheduler-compatible command with the project root as its working directory:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.backup
++```
++
++An external deployment scheduler can invoke it at the chosen backup frequency. No OS scheduler or Codex automation was installed. The command creates and fully verifies a fresh backup before rotation. Optional arguments are `--database`, `--backup-dir`, `--retention-days` (default 30) and `--keep` (default 5, cannot be lower than 5).
++
++Only managed UTC-stamped filenames belonging to the selected database are candidates. Every candidate must pass checksum, SQLite integrity and FK checks. Legacy candidates without sidecars are verified and given checksums first. Corruption or unsafe paths abort rotation before any deletion. Unrelated files remain untouched. A candidate is deleted only if it is **older than** the age limit **and outside the five newest verified backups**. If all backups are old, the newest five still remain. Age uses the UTC creation timestamp in the managed filename rather than a mutable filesystem mtime.
++
++New snapshots have adjacent `<backup>.sha256` files. Startup and the existing `scripts.backup_database` entrypoint also create checksummed snapshots; rotation is performed by `scripts.backup`. Checksum files detect corruption and are not a signature against someone who can rewrite the database and sidecar together.
++
++For recovery, stop writers and restore into a **new** path:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.restore_database 'data\backups\YOUR_BACKUP.db' 'data\recovery\recovered.db' --require-checksum
++```
++
++Strict mode rejects missing/tampered hashes before creating the destination. The default restore API retains compatibility with pre-Stage-3 backups/raw SQLite copies without a sidecar, but always validates integrity, foreign keys and exact logical equality. It never overwrites an existing destination. Use `JD_DB_PATH` to select the verified restored file; do not overwrite an open database or copy just its main file while WAL writers are active.
++
++## Verification and preservation
++
++- Required command: **186 passed**, no failures/skips, in **17.59 seconds**: all **107 existing + 79 new** cases.
++- Full restored-backup gate: **186 passed**, no failures/skips, in **16.45 seconds**. Each database fixture was restored independently from a checksummed synthetic baseline. The dedicated recovery test also proves decision hashes, approval metadata and replay guards survive restore.
++- `pip check`: **No broken requirements found**. Exact production/test lock verification passed. Live OSV: **0 findings across 43 production pins**.
++- Forty upstream `importlib.metadata` deprecation warnings remain in each full Streamlit AppTest run. The Windows sandbox restricts default temp directories and Streamlit sockets, so full application tests ran outside it, as in Stages 1/2.
++- The local additive startup upgrade preserved **15 users, 26 cards, 399 responsibilities, 1 modification request, 28 audit rows and 9 interviews**. Every preexisting column value, ID and sequence was compared against the pre-upgrade snapshot. No credential, historical status or audit event was rewritten.
++- Live factory verification returned `foreign_keys=1`, `journal_mode=wal`, `synchronous=1`. Integrity/FK checks passed. A business-database backup was restored into an isolated private work path and compared against all original records; business rows were never used by pytest.
++- Verified pre-upgrade backup: `data/backups/job_descriptions_20261030T093751.657809Z_43257de7.db` and its SHA-256 sidecar.
++- Verified Stage 3 backup: `data/backups/job_descriptions_20261030T094410.045767Z_20b22bdd.db` and its sidecar. The first rotation verified/sealed existing managed backups and pruned **0** because none were eligible by age/count.
++- Unified patch: `docs/changes/stage3-production.patch`. No database, backup, installed wheel or private recovery artifact is included. The patch is checked/applied against an isolated Stage 2 baseline and all reconstructed text files are compared exactly after newline normalization.
++
++Reproduce the required gate:
++
++```powershell
++$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
++.\.venv\Scripts\python -B -m pytest -q
++.\.venv\Scripts\python -m pip check
++```
++
++To reproduce the recovery gate, create a disposable **synthetic** seed using `build_synthetic_database` in `tests/conftest.py`, back it up with `backups.backup_database`, and pass that backup to:
++
++```powershell
++.\.venv\Scripts\python -B -m pytest tests -q --restored-fixture 'PATH_TO_SYNTHETIC_BACKUP.db'
++```
++
++The explicit `tests` path loads the custom fixture option before pytest parses it. The option rejects real personnel account sets. It is a test-only switch and never changes the normal application database selection.
++
++## References
++
++- [SQLite PRAGMAs](https://www.sqlite.org/pragma.html) and [WAL](https://www.sqlite.org/wal.html).
++- [Streamlit configuration](https://docs.streamlit.io/develop/api-reference/configuration/config.toml).
++- [OSV batch API](https://google.github.io/osv.dev/post-v1-querybatch/).
++- [Pillow package advisories for 12.3.0](https://pypi.org/pypi/pillow/12.3.0/json) and [13.0.0 release](https://pypi.org/project/pillow/13.0.0/).

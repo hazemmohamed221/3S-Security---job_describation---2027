@@ -1,0 +1,23 @@
+[theme]
+primaryColor = "#2563eb"
+backgroundColor = "#f8fafc"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0f172a"
+font = "Cairo:https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap"
+
+[server]
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+port = 8501
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[runner]
+magicEnabled = false

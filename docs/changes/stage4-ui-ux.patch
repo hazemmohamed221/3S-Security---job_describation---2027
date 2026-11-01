@@ -1,0 +1,1045 @@
+--- a/app.py
++++ b/app.py
+@@ -16,6 +16,8 @@
+ import docx_parser
+ import utils
+ import auth
++from presentation import (ADMIN_PAGES, MEMBER_PAGES, render_table, audit_dataframe, audit_column_config,
++                          format_timestamp, arabic_action, arabic_field, readable_notes)
+ from statuses import CardStatus, InterviewStatus
+ from upload_security import sanitize_docx_filename, download_filename, upload_limit_megabytes
+ 
+@@ -51,56 +53,60 @@
+             ('المقابلات', 'interviews'), ('المستخدمون', 'users'))):
+         column.metric(label, summary[key])
+ 
+-    roles = {'employee': 'موظف', 'manager': 'مدير إدارة', 'admin': 'مسؤول النظام'}
+-    st.markdown('#### إضافة مستخدم جديد')
+-    st.caption('كلمة المرور من 12 إلى 1024 حرفاً. الحساب الجديد لا يحصل على بطاقة مخصصة تلقائياً.')
+-    with st.form('admin_create_user', clear_on_submit=True):
+-        username = st.text_input('اسم المستخدم الجديد', max_chars=100, key='admin_new_username')
+-        full_name = st.text_input('الاسم الكامل', max_chars=150, key='admin_new_full_name')
+-        role = st.selectbox('الدور الوظيفي', list(roles), format_func=roles.get, key='admin_new_role')
+-        password = st.text_input('كلمة المرور للمستخدم الجديد', type='password', key='admin_new_password')
+-        if st.form_submit_button('إضافة المستخدم', type='primary'):
+-            st.session_state['_admin_clear_keys'] = [
+-                'admin_new_username', 'admin_new_full_name', 'admin_new_role', 'admin_new_password']
+-            _run_write(database.create_new_user, username, full_name, role, password, actor_id=actor_id)
+-            st.session_state['_admin_flash'] = 'تم إنشاء المستخدم بنجاح.'
+-            st.rerun()
+-
+-    users = _run_write(database.get_all_users, actor_id=actor_id)
+-    st.markdown('#### دليل المستخدمين')
+-    st.dataframe(pd.DataFrame([{
+-        'المعرف': account['id'], 'اسم المستخدم': account['username'], 'الاسم الكامل': account['full_name'],
+-        'الدور': roles.get(account['role'], 'غير معروف'), 'حالة الحساب': 'نشط' if account['is_active'] else 'معطل',
+-    } for account in users]), hide_index=True, use_container_width=True)
+-    if users:
+-        by_id = {account['id']: account for account in users}
+-        selected_id = st.selectbox('اختر الحساب لإدارته', list(by_id),
+-                                   format_func=lambda uid: f"#{uid} — {by_id[uid]['full_name']} ({by_id[uid]['username']})",
+-                                   key='admin_selected_user')
+-        selected = by_id[selected_id]
+-        if selected_id == actor_id:
+-            st.caption('إعادة تعيين كلمة مرور حسابك تتطلب تسجيل الدخول مجدداً. لا يمكنك تعطيل حسابك الحالي.')
+-        with st.form(f'admin_reset_password_{selected_id}', clear_on_submit=True):
+-            replacement = st.text_input('كلمة المرور البديلة', type='password', key=f'admin_reset_secret_{selected_id}')
+-            if st.form_submit_button('إعادة تعيين كلمة المرور'):
+-                st.session_state['_admin_clear_keys'] = [f'admin_reset_secret_{selected_id}']
+-                _run_write(database.admin_reset_password, selected_id, replacement, actor_id=actor_id)
+-                st.session_state['_admin_flash'] = 'تمت إعادة تعيين كلمة المرور وإبطال الجلسات السابقة.'
++    users_tab, backups_tab = st.tabs(['المستخدمون والصلاحيات', 'النسخ الاحتياطي'])
++    with users_tab:
++        roles = {'employee': 'موظف', 'manager': 'مدير إدارة', 'admin': 'مسؤول النظام'}
++        st.markdown('#### إضافة مستخدم جديد')
++        st.caption('كلمة المرور من 12 إلى 1024 حرفاً. الحساب الجديد لا يحصل على بطاقة مخصصة تلقائياً.')
++        with st.form('admin_create_user', clear_on_submit=True):
++            username = st.text_input('اسم المستخدم الجديد', max_chars=100, key='admin_new_username')
++            full_name = st.text_input('الاسم الكامل', max_chars=150, key='admin_new_full_name')
++            role = st.selectbox('الدور الوظيفي', list(roles), format_func=roles.get, key='admin_new_role')
++            password = st.text_input('كلمة المرور للمستخدم الجديد', type='password', key='admin_new_password')
++            if st.form_submit_button('إضافة المستخدم', type='primary'):
++                st.session_state['_admin_clear_keys'] = [
++                    'admin_new_username', 'admin_new_full_name', 'admin_new_role', 'admin_new_password']
++                _run_write(database.create_new_user, username, full_name, role, password, actor_id=actor_id)
++                st.session_state['_admin_flash'] = 'تم إنشاء المستخدم بنجاح.'
+                 st.rerun()
+-        toggle_label = 'تعطيل الحساب' if selected['is_active'] else 'تفعيل الحساب'
+-        if st.button(toggle_label, key=f'admin_toggle_{selected_id}', disabled=selected_id == actor_id):
+-            active = _run_write(database.toggle_user_status, selected_id, actor_id=actor_id,
+-                                expected_active=bool(selected['is_active']))
+-            st.session_state['_admin_flash'] = 'تم تفعيل الحساب.' if active else 'تم تعطيل الحساب وإبطال جلساته.'
+-            st.rerun()
+-
+-    st.markdown('#### النسخ الاحتياطي اليدوي')
+-    if st.button('إنشاء نسخة احتياطية SHA-256', key='admin_manual_backup'):
+-        st.session_state['_admin_backup_receipt'] = _run_write(database.create_manual_backup, actor_id=actor_id)
+-    if receipt := st.session_state.get('_admin_backup_receipt'):
+-        st.success('تم إنشاء النسخة الاحتياطية والتحقق من سلامتها.')
+-        st.text(receipt['name'])
+-        st.code(receipt['sha256'], language=None)
++
++        users = _run_write(database.get_all_users, actor_id=actor_id)
++        st.markdown('#### دليل المستخدمين')
++        render_table(pd.DataFrame([{
++            'المعرف': account['id'], 'اسم المستخدم': account['username'], 'الاسم الكامل': account['full_name'],
++            'الدور': roles.get(account['role'], 'غير معروف'), 'حالة الحساب': 'نشط' if account['is_active'] else 'معطل',
++            'تاريخ الإنشاء': format_timestamp(account['created_at']),
++        } for account in users]))
++        if users:
++            by_id = {account['id']: account for account in users}
++            selected_id = st.selectbox('اختر الحساب لإدارته', list(by_id),
++                                       format_func=lambda uid: f"#{uid} — {by_id[uid]['full_name']} ({by_id[uid]['username']})",
++                                       key='admin_selected_user')
++            selected = by_id[selected_id]
++            if selected_id == actor_id:
++                st.caption('إعادة تعيين كلمة مرور حسابك تتطلب تسجيل الدخول مجدداً. لا يمكنك تعطيل حسابك الحالي.')
++            with st.form(f'admin_reset_password_{selected_id}', clear_on_submit=True):
++                replacement = st.text_input('كلمة المرور البديلة', type='password', key=f'admin_reset_secret_{selected_id}')
++                if st.form_submit_button('إعادة تعيين كلمة المرور'):
++                    st.session_state['_admin_clear_keys'] = [f'admin_reset_secret_{selected_id}']
++                    _run_write(database.admin_reset_password, selected_id, replacement, actor_id=actor_id)
++                    st.session_state['_admin_flash'] = 'تمت إعادة تعيين كلمة المرور وإبطال الجلسات السابقة.'
++                    st.rerun()
++            toggle_label = 'تعطيل الحساب' if selected['is_active'] else 'تفعيل الحساب'
++            if st.button(toggle_label, key=f'admin_toggle_{selected_id}', disabled=selected_id == actor_id):
++                active = _run_write(database.toggle_user_status, selected_id, actor_id=actor_id,
++                                    expected_active=bool(selected['is_active']))
++                st.session_state['_admin_flash'] = 'تم تفعيل الحساب.' if active else 'تم تعطيل الحساب وإبطال جلساته.'
++                st.rerun()
++
++    with backups_tab:
++        st.markdown('#### النسخ الاحتياطي اليدوي')
++        if st.button('إنشاء نسخة احتياطية SHA-256', key='admin_manual_backup'):
++            st.session_state['_admin_backup_receipt'] = _run_write(database.create_manual_backup, actor_id=actor_id)
++        if receipt := st.session_state.get('_admin_backup_receipt'):
++            st.success('تم إنشاء النسخة الاحتياطية والتحقق من سلامتها.')
++            st.text(receipt['name'])
++            st.code(receipt['sha256'], language=None)
+ 
+ 
+ # Page configuration
+@@ -197,8 +203,8 @@
+ st.markdown(f"""
+ <div class="brand-header">
+     <div>
+-        <div class="brand-title">🛡️ شركة ثري إس للأنظمة الأمنية — منظومة الوصف الوظيفي</div>
+-        <div class="brand-subtitle">المستخدم المتصل: <b>{escape(user['full_name'])}</b> | الإدارة: <b>{escape(user['department'] or 'الإدارة العامة')}</b></div>
++        <div class="brand-title">🛡️ ثري إس للأنظمة الأمنية</div>
++        <div class="brand-subtitle">بوابة حوكمة بطاقات الوصف الوظيفي · 2027</div>
+     </div>
+     <div style="text-align: left;">
+         <span class="status-badge {'badge-approved' if is_admin else 'badge-pending'}" style="font-size: 0.9rem; padding: 6px 16px;">
+@@ -212,21 +218,16 @@
+ # ADMIN / HR MANAGER (ROLE B) INTERFACE
+ # -------------------------------------------------------------
+ if is_admin:
+-    tab_dash, tab_reviews, tab_upload, tab_explorer, tab_audit, tab_schedule, tab_settings = st.tabs([
+-        "📊 لوحة المؤشرات والمتابعة",
+-        f"⚖️ مراجعة واعتماد التعديلات ({stats['pending_mods']})",
+-        "📤 رفع بطاقة وورد جديدة (.docx)",
+-        "📁 دليل واستعراض بطاقات الوصف",
+-        "📜 سجل التعديلات التاريخي (Audit Trail)",
+-        "📅 جدول مقابلات مناقشة البطاقات",
+-        "⚙️ لوحة الإدارة والإعدادات"
+-    ])
+-
+-    with tab_settings:
++    if st.session_state.get('primary_navigation') not in ADMIN_PAGES.values():
++        st.session_state.pop('primary_navigation', None)
++    selected_page = st.sidebar.radio('التنقل الرئيسي', list(ADMIN_PAGES.values()), key='primary_navigation')
++    page = next(key for key, label in ADMIN_PAGES.items() if label == selected_page)
++
++    if page == 'settings':
+         render_admin_settings()
+ 
+     # --- TAB 1: DASHBOARD & METRICS ---
+-    with tab_dash:
++    if page == 'dashboard':
+         st.subheader("مؤشرات الإنجاز وموقف مراجعة بطاقات الوصف الوظيفي")
+         col1, col2, col3, col4 = st.columns(4)
+         with col1:
+@@ -269,7 +270,7 @@
+                 dept_counts = df_jds['department'].replace('', 'الإدارة العامة').value_counts().reset_index()
+                 dept_counts.columns = ['الإدارة / القطاع', 'عدد بطاقات الوصف الوظيفي']
+                 dept_counts.index = dept_counts.index + 1
+-                st.dataframe(dept_counts, use_container_width=True)
++                render_table(dept_counts)
+         
+         with col_right:
+             st.markdown("#### ⚡ إجراءات الموارد البشرية السريعة")
+@@ -285,7 +286,7 @@
+             """)
+ 
+     # --- TAB 2: REVIEW MODIFICATIONS (SIDE-BY-SIDE DIFF) ---
+-    with tab_reviews:
++    if page == 'reviews':
+         st.subheader("⚖️ شاشة مراجعة واعتماد طلبات التعديل المقترحة")
+         st.markdown("تتيح هذه الشاشة لمدير الموارد البشرية والإدارة العليا فحص التعديلات المقترحة على أي بند أو مسؤولية وظيفية، مع مقارنة بصرية دقيقة بين النص الحالي والنص المقترح.")
+ 
+@@ -301,7 +302,7 @@
+                     col_meta1, col_meta2, col_meta3 = st.columns(3)
+                     col_meta1.markdown(f"**الوصف الوظيفي:** {req['jd_title']}")
+                     col_meta2.markdown(f"**مقدم الطلب:** `{req['requested_by']}`")
+-                    col_meta3.markdown(f"**تاريخ تقديم الطلب:** {req['requested_at']}")
++                    col_meta3.markdown(f"**تاريخ تقديم الطلب:** {format_timestamp(req['requested_at'])}")
+ 
+                     st.markdown("---")
+                     st.markdown("#### 🔍 المقارنة جنباً إلى جنب (النص وقت تقديم الطلب مقابل التعديل المقترح)")
+@@ -372,7 +373,7 @@
+                                 st.error(msg)
+ 
+     # --- TAB 3: UPLOAD NEW JD (.docx) ---
+-    with tab_upload:
++    if page == 'import':
+         st.subheader("📤 رفع بطاقات وصف وظيفي جديدة بصيغة Word (.docx)")
+         st.markdown("""
+         يمكن لمسؤول النظام رفع ملفات Word إضافية تتبع النموذج الرسمي المعتمد لشركة **ثري إس للأنظمة الأمنية**.
+@@ -417,7 +418,7 @@
+                                     "بيان المسؤولية والواجب الوظيفي": a['description'],
+                                     "مؤشر قياس الأداء (KPI)": a['kpi'] or '—'
+                                 })
+-                            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
++                            render_table(pd.DataFrame(preview_rows))
+ 
+                         # Confirmation button to insert into DB
+                         if st.button(f"💾 تأكيد وإدراج بطاقة '{title_preview}' في قاعدة البيانات", key=f"btn_import_{upload_index}_{safe_name}"):
+@@ -436,7 +437,7 @@
+                         st.error(f"تعذر استيراد الملف {safe_name}. يرجى التحقق من الملف والمحاولة مجدداً.")
+ 
+     # --- TAB 4: JOB DESCRIPTIONS EXPLORER ---
+-    with tab_explorer:
++    if page == 'directory':
+         st.subheader("📁 الدليل الشامل لبطاقات الوصف الوظيفي")
+         all_jds = database.get_all_jds()
+ 
+@@ -525,7 +526,7 @@
+                         "بيان المسؤولية والواجب الوظيفي": a['description'],
+                         "مؤشر قياس الأداء (KPI)": a['kpi'] or '—'
+                     })
+-                st.dataframe(pd.DataFrame(acc_rows), use_container_width=True, hide_index=True)
++                render_table(pd.DataFrame(acc_rows))
+             else:
+                 st.info("لا توجد مسؤوليات مسجلة.")
+             st.markdown("</div>", unsafe_allow_html=True)
+@@ -573,46 +574,42 @@
+                 """, unsafe_allow_html=True)
+ 
+     # --- TAB 5: AUDIT TRAIL & VERSION HISTORY ---
+-    with tab_audit:
++    if page == 'audit':
+         st.subheader("📜 سجل التعديلات التاريخي وتتبع النسخ (Audit Trail)")
+         st.markdown("سجل رقمي غير قابل للتعديل يوثق كل عملية اعتماد، تعديل بند، أو استيراد مع تسجيل الوقت والمستخدم والنص قبل وبعد التعديل.")
+ 
+         audit_records = database.get_audit_trail()
+         if audit_records:
+-            audit_display_rows = []
+-            for r in audit_records:
+-                audit_display_rows.append({
+-                    "رقم السجل": r['id'],
+-                    "تاريخ وساعة التعديل": r['changed_at'],
+-                    "مسمى الوظيفة": r['jd_title'],
+-                    "البند المعني": r['section_name'],
+-                    "نوع الإجراء": r['action'],
+-                    "القائم بالإجراء": r['changed_by'],
+-                    "ملاحظات": r['notes']
+-                })
+-            st.dataframe(pd.DataFrame(audit_display_rows), use_container_width=True, hide_index=True)
++            st.caption('يمكن تمرير الجدول أفقياً أو فتحه بملء الشاشة. اختر سجلاً أسفله لقراءة جميع التفاصيل دون اختصار.')
++            render_table(audit_dataframe(audit_records), column_config=audit_column_config(),
++                         key='audit_table', row_height=88)
+ 
+             st.markdown("#### 🔎 فحص ومقارنة نص تعديل محدد")
+             selected_audit_id = st.selectbox(
+                 "اختر سجل التعديل لعرض النص القديم مقابل النص الجديد:",
+                 options=[r['id'] for r in audit_records],
+-                format_func=lambda x: next(f"سجل #{r['id']} - {r['changed_at']} | {r['jd_title']} | {r['action']}" for r in audit_records if r['id'] == x)
++                format_func=lambda x: next(f"سجل #{r['id']} - {format_timestamp(r['changed_at'])} | {r['jd_title']} | {arabic_action(r['action'])}" for r in audit_records if r['id'] == x)
+             )
+ 
+             rec = next((r for r in audit_records if r['id'] == selected_audit_id), None)
++            if rec:
++                st.markdown('#### تفاصيل السجل كاملة')
++                st.text(f"{rec['jd_title']} · {arabic_field(rec['section_name'])} · {arabic_action(rec['action'])}")
++                st.caption(f"تاريخ ووقت التعديل: {format_timestamp(rec['changed_at'])}")
++                st.text(readable_notes(rec['notes']))
+             if rec and (rec['old_text'] or rec['new_text']):
+                 c_old, c_new = st.columns(2)
+                 with c_old:
+                     st.markdown("**النص قبل التعديل:**")
+-                    st.markdown(f"""<div class="diff-box diff-old">{rec['old_text'] or '<i>(لا يوجد)</i>'}</div>""", unsafe_allow_html=True)
++                    st.markdown(f"""<div class="diff-box diff-old">{escape(rec['old_text']).replace(chr(10), '<br>') if rec['old_text'] else '<i>(لا يوجد)</i>'}</div>""", unsafe_allow_html=True)
+                 with c_new:
+                     st.markdown("**النص المعتمد بعد التعديل:**")
+-                    st.markdown(f"""<div class="diff-box diff-new">{rec['new_text'] or '<i>(لا يوجد)</i>'}</div>""", unsafe_allow_html=True)
++                    st.markdown(f"""<div class="diff-box diff-new">{escape(rec['new_text']).replace(chr(10), '<br>') if rec['new_text'] else '<i>(لا يوجد)</i>'}</div>""", unsafe_allow_html=True)
+         else:
+             st.info("لا توجد سجلات تعديل حتى الآن.")
+ 
+     # --- TAB 6: INTERVIEW SCHEDULE ---
+-    with tab_schedule:
++    if page == 'interviews':
+         st.subheader("📅 جدول مقابلات مناقشة واعتماد الوصف الوظيفي لمديري الإدارات")
+         st.markdown("متابعة الاجتماعات والمقابلات المنسقة مع السادة مديري الإدارات لمناقشة محاور التكامل واعتماد البطاقات النهائية وفقاً للمخطط الرئيسي.")
+ 
+@@ -625,11 +622,12 @@
+                     "الإدارة / القطاع": it['department'],
+                     "المدير المسؤول": it['manager_name'],
+                     "اليوم والتاريخ": it['day_date'],
++                    "وقت المقابلة": it['meeting_time'] or 'غير محدد',
+                     "حالة المقابلة": it['status'],
+                     "محاور النقاش الرئيسية والتكامل المطلوب": it['discussion_topics'],
+                     "ملاحظات ومخرجات الاجتماع": it['notes'] or '—'
+                 })
+-            st.dataframe(pd.DataFrame(sch_display), use_container_width=True, hide_index=True)
++            render_table(pd.DataFrame(sch_display))
+ 
+             st.markdown("#### ✏️ تحديث حالة المقابلة وتوثيق المخرجات")
+             item_options = {f"#{it['seq_num']}: {it['department']} - {it['manager_name']}": it['id'] for it in schedule_items}
+@@ -664,29 +662,30 @@
+ else:
+     all_jds = database.get_all_jds()
+     assigned_jd_id = user.get('assigned_jd_id')
+-    
+-    if not all_jds or assigned_jd_id not in {j['id'] for j in all_jds}:
+-        st.info("لم يتم تخصيص بطاقة وصف وظيفي صالحة لحسابك. يرجى التواصل مع الموارد البشرية.")
+-        if all_jds:
+-            st.dataframe(pd.DataFrame(all_jds)[['title', 'department', 'reports_to', 'status', 'version']], hide_index=True)
++    if st.session_state.get('primary_navigation') not in MEMBER_PAGES.values():
++        st.session_state.pop('primary_navigation', None)
++    selected_page = st.sidebar.radio('التنقل الرئيسي', list(MEMBER_PAGES.values()), key='primary_navigation')
++    page = next(key for key, label in MEMBER_PAGES.items() if label == selected_page)
++    available_ids = {card['id'] for card in all_jds}
++    if page in ('card', 'export') and assigned_jd_id not in available_ids:
++        st.info('لم يتم تخصيص بطاقة وصف وظيفي صالحة لحسابك. يرجى التواصل مع الموارد البشرية.')
+         st.stop()
+-
+-    tab_my_jd, tab_my_requests, tab_company_jds, tab_export = st.tabs([
+-        "📋 بطاقة الوصف الوظيفي الخاصة بي",
+-        "📬 متابعة طلبات التعديل المقدمة مني",
+-        "🏢 دليل بطاقات إدارات الشركة" if is_manager else "🏢 استعراض الوظائف الأخرى",
+-        "📥 تحميل وطباعة البطاقة"
+-    ])
++    current_jd_id = assigned_jd_id
++    if is_manager and st.session_state.get('viewed_jd_id') in available_ids:
++        current_jd_id = st.session_state['viewed_jd_id']
++    jd = database.get_jd_by_id(current_jd_id) if current_jd_id in available_ids else None
++    accountabilities = database.get_accountabilities(current_jd_id) if jd else []
+ 
+     # --- TAB 1: MY JOB DESCRIPTION ---
+-    with tab_my_jd:
++    if page == 'card':
+         if is_manager:
+             col_sel1, col_sel2 = st.columns([3, 1])
+             with col_sel1:
+                 jd_map = {f"{j['title']} ({j['department'] or 'الإدارة العامة'})": j['id'] for j in all_jds}
+-                default_index = list(jd_map.values()).index(assigned_jd_id) if assigned_jd_id in jd_map.values() else 0
++                default_index = list(jd_map.values()).index(current_jd_id) if current_jd_id in jd_map.values() else 0
+                 selected_label = st.selectbox("بطاقة الوصف الوظيفي المعروضة حالياً للمراجعة:", list(jd_map.keys()), index=default_index)
+                 current_jd_id = jd_map[selected_label]
++                st.session_state['viewed_jd_id'] = current_jd_id
+         else:
+             current_jd_id = assigned_jd_id
+ 
+@@ -836,7 +835,7 @@
+                     "بيان المسؤولية والواجب الوظيفي": a['description'],
+                     "مؤشر قياس الأداء (KPI)": a['kpi'] or '—'
+                 })
+-            st.dataframe(pd.DataFrame(acc_list), use_container_width=True, hide_index=True)
++            render_table(pd.DataFrame(acc_list))
+         else:
+             st.info("لا توجد مسؤوليات مسجلة.")
+         st.markdown("</div>", unsafe_allow_html=True)
+@@ -881,7 +880,7 @@
+             """, unsafe_allow_html=True)
+ 
+     # --- TAB 2: MY MODIFICATION REQUESTS ---
+-    with tab_my_requests:
++    if page == 'requests':
+         st.subheader("📬 متابعة طلبات التعديل المقدمة من طرفي")
+         my_reqs = database.get_requests_by_user(user['full_name'])
+ 
+@@ -890,7 +889,7 @@
+         else:
+             for r in my_reqs:
+                 badge_type = "badge-approved" if r['status'] == 'مقبول' else ("badge-rejected" if r['status'] == 'مرفوض' else "badge-under-review")
+-                with st.expander(f"طلب #{r['id']} — {r['section_name']} ({r['status']}) - {r['requested_at']}", expanded=True):
++                with st.expander(f"طلب #{r['id']} — {r['section_name']} ({r['status']}) - {format_timestamp(r['requested_at'])}", expanded=True):
+                     st.markdown(f"**الوصف الوظيفي المستهدف:** {r['jd_title']}")
+                     st.markdown(f"**حالة الطلب:** <span class='status-badge {badge_type}'>{r['status']}</span>", unsafe_allow_html=True)
+                     st.markdown(f"**المبرر الفني المقدم:** {r['justification']}")
+@@ -911,15 +910,15 @@
+                         st.markdown(f"""<div class="diff-box diff-new">{r['proposed_text']}</div>""", unsafe_allow_html=True)
+ 
+     # --- TAB 3: COMPANY JDS DIRECTORY ---
+-    with tab_company_jds:
++    if page == 'directory':
+         st.subheader("🏢 الدليل التعريفي لبطاقات إدارات شركة ثري إس")
+         st.markdown("استعراض بطاقات الوظائف الأخرى لضمان وضوح فواصل المسؤوليات وتنسيق المهام بين الإدارات المختلفة.")
+-        all_jds_df = pd.DataFrame(all_jds)[['title', 'department', 'reports_to', 'status', 'version']]
++        all_jds_df = pd.DataFrame(all_jds, columns=['title', 'department', 'reports_to', 'status', 'version'])[['title', 'department', 'reports_to', 'status', 'version']]
+         all_jds_df.columns = ['المسمى الوظيفي', 'الإدارة التابع لها', 'المسؤول المباشر', 'حالة الاعتماد', 'رقم الإصدار']
+-        st.dataframe(all_jds_df, use_container_width=True, hide_index=True)
++        render_table(all_jds_df)
+ 
+     # --- TAB 4: EXPORT DOCUMENT ---
+-    with tab_export:
++    if page == 'export':
+         st.subheader("📥 تنزيل وطباعة بطاقة الوصف الوظيفي المعتمدة")
+         st.markdown("يمكنك تنزيل نسخة رسمية منسقة بملف Word (.docx) باللغة العربية وتحتوي على كافة الجداول ومربعات التوقيع الرسمية.")
+         doc_stream = docx_parser.export_jd_to_docx(*database.get_export_data(jd['id']))
+--- a/auth.py
++++ b/auth.py
+@@ -97,9 +97,8 @@
+     """
+     init_auth()
+ 
+-    st.sidebar.markdown("### 🏢 شركة ثري إس للأنظمة الأمنية")
+-    st.sidebar.markdown("**منظومة حوكمة واعتماد بطاقات الوصف الوظيفي — 2027**")
+-    st.sidebar.markdown("---")
++    st.sidebar.markdown('<div class="sidebar-brand">🛡️ ثري إس للأنظمة الأمنية'
++                        '<small>بوابة حوكمة الوصف الوظيفي · 2027</small></div>', unsafe_allow_html=True)
+ 
+     if not st.session_state.logged_in:
+         st.sidebar.subheader("🔐 تسجيل الدخول إلى النظام")
+@@ -131,13 +130,12 @@
+         badge_class = "badge-approved" if user['role'] == 'admin' else "badge-pending"
+ 
+         st.sidebar.markdown(f"""
+-        <div style="background-color: #f1f5f9; padding: 14px; border-radius: 10px; border: 1px solid #cbd5e1; margin-bottom: 14px; direction: rtl; text-align: right;">
+-            <div style="font-size: 0.8rem; color: #64748b; font-weight: 700;">المستخدم الحالي:</div>
+-            <div style="font-size: 1.1rem; font-weight: 800; color: #0f172a; margin-top: 2px;">{html.escape(user['full_name'])}</div>
++        <div class="sidebar-profile">
++            <div class="profile-name">{html.escape(user['full_name'])}</div>
+             <div style="margin-top: 8px;">
+                 <span class="status-badge {badge_class}">{role_label}</span>
+             </div>
+-            <div style="font-size: 0.85rem; color: #475569; margin-top: 8px;">
++            <div class="profile-department">
+                 الإدارة التابع لها: <b>{html.escape(user['department'] or 'الإدارة العامة')}</b>
+             </div>
+         </div>
+--- a/utils.py
++++ b/utils.py
+@@ -53,76 +53,106 @@
+     <style>
+     @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap');
+     
+-    /* Global RTL Direction & Font */
+-    html, body, [data-testid="stAppViewContainer"], .main, [data-testid="stSidebar"], [data-testid="stSidebarContent"], .stApp {
+-        direction: rtl !important;
+-        text-align: right !important;
+-        font-family: 'Cairo', -apple-system, BlinkMacSystemFont, Tahoma, sans-serif !important;
+-    }
+-
+-    /* Streamlit components RTL overrides */
+-    h1, h2, h3, h4, h5, h6, p, div, span, label, input, textarea, select, button {
+-        font-family: 'Cairo', -apple-system, BlinkMacSystemFont, Tahoma, sans-serif !important;
+-        text-align: right !important;
+-    }
+-
+-    /* RTL for Dataframes and Tables */
+-    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+-        direction: rtl !important;
+-        text-align: right !important;
+-    }
+-    div[data-testid="stDataFrame"] * {
+-        text-align: right !important;
+-        direction: rtl !important;
+-    }
+-    table {
+-        direction: rtl !important;
+-        text-align: right !important;
+-        width: 100% !important;
+-        border-collapse: collapse !important;
+-    }
+-    th {
+-        background-color: #1e3a5f !important;
+-        color: white !important;
+-        text-align: right !important;
+-        font-weight: 700 !important;
+-        padding: 10px 12px !important;
+-    }
+-    td {
+-        text-align: right !important;
+-        padding: 8px 12px !important;
+-        border-bottom: 1px solid #e2e8f0 !important;
+-    }
+-
+-    /* Tabs RTL */
+-    button[data-baseweb="tab"] {
+-        direction: rtl !important;
+-        font-weight: 700 !important;
+-        font-size: 1rem !important;
++    /* Inherit Cairo for text; never override every div/span or icon glyphs. */
++    html, body, .stApp, [data-testid="stAppViewContainer"] {
++        direction: rtl;
++        text-align: right;
++        font-family: 'Cairo', Tahoma, sans-serif;
++    }
++    h1, h2, h3, h4, h5, h6, [data-testid="stMarkdownContainer"],
++    [data-testid="stWidgetLabel"], input, textarea, select, button {
++        font-family: 'Cairo', Tahoma, sans-serif;
++    }
++    [data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"],
++    input, textarea, select, button, [data-testid="stAlert"] {
++        direction: rtl;
++        text-align: right;
++    }
++    input, textarea { line-height: 1.8; }
++    [data-testid="stIconMaterial"] {
++        direction: ltr;
++        text-align: center;
++        flex-shrink: 0;
++    }
++    /* The canvas keeps its native coordinate system. Column config aligns text. */
++    [data-testid="stDataFrame"] {
++        direction: ltr;
++        margin-top: 20px;
++        margin-bottom: 18px;
++        padding-top: 12px;
++    }
++    [data-testid="stTable"] table { direction: rtl; width: 100%; }
++    [data-testid="stTable"] th, [data-testid="stTable"] td {
++        text-align: right;
++        padding: 10px 12px;
++    }
++    .stDeployButton, [data-testid="stAppDeployButton"],
++    [data-testid="stMainMenu"], #MainMenu, footer { display: none !important; }
++    [data-testid="stHeader"] { background: transparent; }
++    [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
++    [data-testid="stSidebar"] { width: 340px !important; min-width: 320px; }
++    [data-testid="stSidebarUserContent"] { padding: 1rem 1.1rem 1.5rem; }
++    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .65rem; }
++    .sidebar-brand { padding: 4px 0 8px; line-height: 1.7; font-weight: 800; font-size: 15px; }
++    .sidebar-brand small { display: block; color: #64748b; font-size: 11px; font-weight: 500; }
++    .sidebar-profile {
++        background: #fff; border: 1px solid #dbe3ef; border-radius: 12px;
++        padding: 12px 14px; line-height: 1.7; margin-bottom: 2px;
++        white-space: normal; word-break: normal; overflow-wrap: break-word;
++    }
++    .sidebar-profile .profile-name { font-size: 16px; font-weight: 800; margin-bottom: 6px; }
++    .sidebar-profile .profile-department { font-size: 12px; color: #475569; margin-top: 6px; }
++    [data-testid="stSidebar"] [role="radiogroup"] { flex-direction: column; gap: 4px; }
++    [data-testid="stSidebar"] [data-baseweb="radio"],
++    [data-testid="stSidebar"] [data-testid="stRadioOption"] {
++        margin: 0; padding: 5px 8px; border: 1px solid transparent; border-radius: 9px;
++        align-items: flex-start; white-space: normal;
++    }
++    [data-testid="stSidebar"] [data-baseweb="radio"]:has(input:checked),
++    [data-testid="stSidebar"] [data-testid="stRadioOption"]:has(input:checked) {
++        background: #e8f0ff; border-color: #b8cff9;
++    }
++    .st-key-primary_navigation [role="radiogroup"] > div:nth-child(7) label {
++        border-color: #c7d8f5; font-weight: 800; background: #f0f5ff;
++    }
++    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
++        word-break: normal; white-space: normal; line-height: 1.65;
++    }
++    [data-testid="stAlert"] { padding: 14px 18px; overflow: visible; }
++    [data-testid="stCode"] { direction: ltr; text-align: left; }
++    [data-testid="stTabs"] [role="tablist"] { gap: 8px; flex-wrap: wrap; }
++    button[data-baseweb="tab"] { font-weight: 700; }
++    @media (max-width: 768px) {
++        [data-testid="stSidebar"] { width: min(340px, calc(100vw - 24px)) !important; min-width: 0; }
++        .brand-header { flex-direction: column; align-items: stretch; gap: 12px; padding: 18px; }
++        .brand-title { font-size: 1.3rem; }
+     }
+ 
+     /* Top Brand Header */
+     .brand-header {
+         background: linear-gradient(135deg, #0a2540 0%, #173b64 60%, #1e5a88 100%);
+         color: white;
+-        padding: 1.5rem 2rem;
++        padding: 1.1rem 1.4rem;
+         border-radius: 12px;
+         margin-bottom: 1.5rem;
+         box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+         display: flex;
++        flex-wrap: wrap;
++        gap: 16px;
+         justify-content: space-between;
+         align-items: center;
+         direction: rtl;
+         text-align: right;
+     }
+     .brand-title {
+-        font-size: 1.75rem;
++        font-size: 1.4rem;
++        line-height: 1.6;
+         font-weight: 800;
+         margin: 0;
+         color: #ffffff;
+     }
+     .brand-subtitle {
+-        font-size: 0.95rem;
++        font-size: 0.85rem;
+         color: #93c5fd;
+         margin-top: 4px;
+         font-weight: 500;
+@@ -179,6 +209,9 @@
+     /* Badges */
+     .status-badge {
+         display: inline-block;
++        max-width: 100%;
++        white-space: normal;
++        line-height: 1.8;
+         padding: 5px 14px;
+         border-radius: 9999px;
+         font-size: 0.85rem;
+@@ -226,12 +259,6 @@
+         color: #14532d;
+     }
+ 
+-    /* Radio buttons & Checkboxes aligned right */
+-    div[data-testid="stRadio"] > div {
+-        flex-direction: row-reverse !important;
+-        justify-content: flex-end !important;
+-    }
+-
+     /* Expander header bold */
+     div[data-testid="stExpander"] details summary {
+         font-weight: 700 !important;
+--- a/.streamlit/config.toml
++++ b/.streamlit/config.toml
+@@ -3,7 +3,7 @@
+ backgroundColor = "#f8fafc"
+ secondaryBackgroundColor = "#ffffff"
+ textColor = "#0f172a"
+-font = "sans serif"
++font = "Cairo:https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap"
+ 
+ [server]
+ headless = true
+@@ -17,6 +17,7 @@
+ 
+ [client]
+ showErrorDetails = false
++toolbarMode = "minimal"
+ 
+ [runner]
+ magicEnabled = false
+--- a/tests/test_app_smoke.py
++++ b/tests/test_app_smoke.py
+@@ -4,6 +4,7 @@
+ 
+ import pytest
+ from password_security import hash_password
++from presentation import ADMIN_PAGES
+ 
+ 
+ @pytest.mark.parametrize("username,role", [("hr", "admin"), ("manager", "manager"), ("staff", "employee")])
+@@ -66,6 +67,7 @@
+     app.sidebar.text_input[1].input("synthetic-secret")
+     app.sidebar.button[0].click().run()
+     assert not app.exception and not app.error
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['reviews']).run()
+     next(button for button in app.button if button.label == "✅ قبول واعتماد التعديل").click().run()
+     assert not app.exception and not app.error
+     with sqlite3.connect(db) as conn:
+@@ -83,6 +85,7 @@
+     app.sidebar.text_input[1].input("synthetic-secret")
+     app.sidebar.button[0].click().run()
+     assert not app.exception
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['interviews']).run()
+     notes = next(widget for widget in app.text_area if widget.label == "الملاحظات ومخرجات الاجتماع المتفق عليها")
+     assert notes.value == "ملاحظات محفوظة"
+     next(button for button in app.button if button.label == "حفظ وتحديث حالة المقابلة").click().run()
+--- a/tests/test_stage2_app.py
++++ b/tests/test_stage2_app.py
+@@ -4,6 +4,7 @@
+ 
+ from password_security import hash_password
+ import governance
++from presentation import ADMIN_PAGES
+ 
+ 
+ def login(db, username):
+@@ -22,6 +23,7 @@
+     with sqlite3.connect(db) as conn:
+         conn.execute("INSERT INTO interview_schedule(id,department,manager_name,status,notes) VALUES(1,'إدارة','مدير','مكتملة','ملاحظات قديمة')")
+     app = login(db, 'hr')
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['interviews']).run()
+     with sqlite3.connect(db) as conn:
+         conn.execute("UPDATE interview_schedule SET notes='مخرجات أحدث' WHERE id=1")
+     next(b for b in app.button if b.label == 'حفظ وتحديث حالة المقابلة').click().run()
+--- a/tests/test_admin_management.py
++++ b/tests/test_admin_management.py
+@@ -263,18 +263,19 @@
+ @pytest.mark.parametrize('username,role', [('manager', 'manager'), ('staff', 'employee')])
+ def test_admin_panel_is_hidden_even_when_nonadmin_tampers_with_user_state(db, username, role):
+     app = login_app(db, username)
+-    assert PANEL not in [tab.label for tab in app.get('tab')]
++    assert PANEL not in app.sidebar.radio[0].options
+     app.session_state['user'] = {'id': 1, 'role': 'admin'}
+     app.run()
+     assert not app.exception and not app.error
+     assert app.session_state['user']['role'] == role
+-    assert PANEL not in [tab.label for tab in app.get('tab')]
++    assert PANEL not in app.sidebar.radio[0].options
+     assert not any(button.label == 'إضافة المستخدم' for button in app.button)
+ 
+ 
+ def test_real_admin_dashboard_create_reset_toggle_and_manual_backup(db):
+     app = login_app(db, 'hr')
+-    assert PANEL in [tab.label for tab in app.get('tab')]
++    assert PANEL in app.sidebar.radio[0].options
++    app.sidebar.radio[0].set_value(PANEL).run()
+     next(w for w in app.text_input if w.key == 'admin_new_username').input('ui-user')
+     next(w for w in app.text_input if w.key == 'admin_new_full_name').input('مستخدم الواجهة')
+     next(w for w in app.selectbox if w.key == 'admin_new_role').select('manager')
+--- /dev/null
++++ b/presentation.py
+@@ -0,0 +1,126 @@
++"""Arabic presentation only: navigation, table schemas and readable audit values."""
++import re
++from zoneinfo import ZoneInfo
++
++import pandas as pd
++import streamlit as st
++
++ADMIN_PAGES = {
++    'dashboard': '📊 لوحة المؤشرات والمتابعة',
++    'directory': '📋 دليل واستعراض بطاقات الوصف',
++    'reviews': '✍️ مراجعة واعتماد التعديلات',
++    'import': '📤 استيراد وتحديث بطاقة (Word)',
++    'interviews': '📅 مقابلات مناقشة البطاقات',
++    'audit': '📜 سجل التعديلات التاريخي (Audit Trail)',
++    'settings': '⚙️ لوحة الإدارة والإعدادات',
++}
++MEMBER_PAGES = {
++    'card': '📋 بطاقة الوصف الوظيفي الخاصة بي',
++    'requests': '📬 متابعة طلبات التعديل المقدمة مني',
++    'directory': ADMIN_PAGES['directory'],
++    'export': '📥 تحميل وطباعة البطاقة',
++}
++ROLE_LABELS = {'admin': 'مسؤول النظام', 'manager': 'مدير إدارة', 'employee': 'موظف'}
++COLUMN_LABELS = {'id': 'المعرف', 'title': 'المسمى الوظيفي', 'department': 'الإدارة',
++                 'reports_to': 'المسؤول المباشر', 'status': 'الحالة', 'version': 'الإصدار',
++                 'created_at': 'تاريخ الإنشاء', 'updated_at': 'تاريخ التحديث'}
++ACTION_LABELS = {
++    'update': 'تعديل بيانات', 'direct update': 'تعديل بيانات',
++    'approve': 'اعتماد نهائي', 'approved': 'اعتماد نهائي', 'approved as is': 'اعتماد نهائي دون تعديل',
++    'accept': 'قبول تعديل', 'accepted': 'قبول تعديل', 'modification accepted': 'قبول تعديل',
++    'reject': 'رفض', 'rejected': 'رفض', 'modification rejected': 'رفض تعديل',
++    'import': 'استيراد بطاقة', 'initial import': 'استيراد بطاقة',
++    'create': 'إنشاء', 'insert': 'إضافة', 'delete': 'حذف',
++}
++FIELD_LABELS = {
++    'purpose': 'الهدف العام من الوظيفة', 'job purpose': 'الهدف العام من الوظيفة',
++    'competencies': 'الجدارات والكفاءات', 'qualifications': 'المؤهلات والخبرات',
++    'accountability': 'المسؤوليات والواجبات', 'accountabilities': 'المسؤوليات والواجبات',
++    'status': 'حالة الوثيقة', 'document status': 'حالة الوثيقة', 'full document': 'كامل الوثيقة',
++    'title': 'المسمى الوظيفي', 'department': 'الإدارة', 'frameworks': 'الصلاحيات وحدود القرارات',
++    'hazards': 'مخاطر الوظيفة', 'safe practices': 'ممارسات السلامة',
++    'internal relations': 'العلاقات الداخلية', 'external relations': 'العلاقات الخارجية',
++    'reports to': 'المسؤول المباشر', 'job code': 'كود الوظيفة', 'dimensions': 'أبعاد الوظيفة',
++}
++
++
++def _code(value):
++    return re.sub(r'[_-]+', ' ', str(value or '')).strip().casefold()
++
++
++def arabic_action(value):
++    return ACTION_LABELS.get(_code(value), str(value or 'غير محدد'))
++
++
++def arabic_field(value):
++    return FIELD_LABELS.get(_code(value), str(value or 'كامل الوثيقة'))
++
++
++def format_timestamp(value):
++    """Convert aware timestamps to Cairo; do not invent a timezone for legacy data."""
++    if value is None or value is pd.NA or (isinstance(value, str) and not value.strip()):
++        return 'غير محدد'
++    try:
++        timestamp = pd.Timestamp(value)
++        if pd.isna(timestamp):
++            return 'غير محدد'
++        if timestamp.tzinfo is not None:
++            timestamp = timestamp.tz_convert(ZoneInfo('Africa/Cairo'))
++        return timestamp.strftime('%Y-%m-%d %H:%M')
++    except (ValueError, TypeError, OverflowError):
++        return 'تاريخ غير صالح'
++
++
++def readable_notes(value):
++    text = str(value or '—')
++    for name, label in (('actor_id', 'معرف المنفذ'), ('version', 'الإصدار')):
++        text = re.sub(rf'\b{name}\s*=\s*(\d+)', rf'{label}: \1', text)
++    return text
++
++
++def audit_dataframe(records):
++    columns = ['id', 'created_at', 'job_title', 'target_field', 'action_type', 'actor_name', 'notes']
++    return pd.DataFrame([{
++        'id': row['id'], 'created_at': format_timestamp(row.get('changed_at')),
++        'job_title': row.get('jd_title') or 'غير محدد',
++        'target_field': arabic_field(row.get('section_name')),
++        'action_type': arabic_action(row.get('action')),
++        'actor_name': ROLE_LABELS.get(row.get('changed_by'), row.get('changed_by') or 'غير محدد'),
++        'notes': readable_notes(row.get('notes')),
++    } for row in records], columns=columns)
++
++
++def audit_column_config():
++    return {
++        'id': st.column_config.NumberColumn('رقم السجل', width=95, format='%d', alignment='right'),
++        'created_at': st.column_config.TextColumn('تاريخ ووقت التعديل', width=190, alignment='right'),
++        'job_title': st.column_config.TextColumn('المسمى الوظيفي', width=320, alignment='right'),
++        'target_field': st.column_config.TextColumn('البند المعني', width=240, alignment='right'),
++        'action_type': st.column_config.TextColumn('نوع الإجراء', width=190, alignment='right'),
++        'actor_name': st.column_config.TextColumn('القائم بالإجراء', width=210, alignment='right'),
++        'notes': st.column_config.TextColumn('الملاحظات', width=420, alignment='right'),
++    }
++
++
++def render_table(data, *, column_config=None, key=None, row_height=68):
++    """Every grid gets a declared schema, sensible widths and native icon fonts."""
++    frame = pd.DataFrame(data).copy()
++    config = {}
++    for column in frame.columns:
++        name = COLUMN_LABELS.get(str(column), str(column))
++        if pd.api.types.is_datetime64_any_dtype(frame[column]) or str(column) in (
++                'created_at', 'updated_at', 'changed_at', 'requested_at', 'reviewed_at',
++                'تاريخ الإنشاء', 'تاريخ ووقت التعديل', 'تاريخ وساعة التعديل'):
++            frame[column] = frame[column].map(format_timestamp)
++        elif str(column) == 'اليوم والتاريخ':
++            frame[column] = frame[column].map(lambda value: format_timestamp(value)
++                if re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}', str(value)) else (value or 'غير محدد'))
++        if pd.api.types.is_numeric_dtype(frame[column]):
++            config[column] = st.column_config.NumberColumn(name, width=220 if len(name) > 12 else 100,
++                                                           alignment='right')
++        else:
++            width = 420 if any(word in name for word in ('مسؤولية', 'بيان', 'ملاحظ', 'محاور')) else 220
++            config[column] = st.column_config.TextColumn(name, width=width, alignment='right')
++    config.update(column_config or {})
++    return st.dataframe(frame, width='stretch', hide_index=True, column_config=config,
++                        row_height=row_height, key=key)
+--- /dev/null
++++ b/tests/test_stage4_ui.py
+@@ -0,0 +1,160 @@
++"""Presentation-only regression coverage for Arabic navigation and native grids."""
++from copy import deepcopy
++from pathlib import Path
++import re
++import sqlite3
++
++import pandas as pd
++import pytest
++
++import auth
++import database
++import docx_parser
++from presentation import (ADMIN_PAGES, MEMBER_PAGES, arabic_action, audit_dataframe,
++                          audit_column_config, format_timestamp, render_table)
++from utils import get_custom_css
++
++
++@pytest.mark.parametrize('value,expected', [
++    ('2026-10-30 09:45:30', '2026-10-30 09:45'),
++    ('2026-10-30T09:45:30+00:00', '2026-10-30 11:45'),
++    ('2026-07-01T06:30:59Z', '2026-07-01 09:30'),
++    (None, 'غير محدد'), ('', 'غير محدد'), ('not-a-date', 'تاريخ غير صالح'),
++    (pd.NA, 'غير محدد'),
++])
++def test_timestamp_display_has_minutes_and_respects_legacy_timezone(value, expected):
++    assert format_timestamp(value) == expected
++
++
++@pytest.mark.parametrize('code,label', [
++    ('update', 'تعديل بيانات'), ('Direct Update', 'تعديل بيانات'), ('approve', 'اعتماد نهائي'),
++    ('reject', 'رفض'), ('import', 'استيراد بطاقة'), ('Initial Import', 'استيراد بطاقة'),
++    ('modification_accepted', 'قبول تعديل'), ('تم اعتماد التعديل', 'تم اعتماد التعديل'),
++])
++def test_audit_actions_have_readable_arabic_labels(code, label):
++    assert arabic_action(code) == label
++
++
++def test_audit_dataframe_does_not_change_stored_values_or_truncate_text():
++    records = [{'id': 1, 'changed_at': '2026-10-30T09:45:30+00:00', 'jd_title': 'المسمى الوظيفي الكامل',
++                'section_name': 'Competencies', 'action': 'update', 'changed_by': 'admin',
++                'notes': 'actor_id=1; version=7; ' + 'ملاحظات كاملة ' * 40}]
++    original = deepcopy(records)
++    frame = audit_dataframe(records)
++    assert records == original
++    assert frame.loc[0, 'action_type'] == 'تعديل بيانات'
++    assert frame.loc[0, 'actor_name'] == 'مسؤول النظام'
++    assert frame.loc[0, 'target_field'] == 'الجدارات والكفاءات'
++    assert frame.loc[0, 'created_at'] == '2026-10-30 11:45'
++    assert 'معرف المنفذ: 1' in frame.loc[0, 'notes'] and 'الإصدار: 7' in frame.loc[0, 'notes']
++    assert frame.loc[0, 'notes'].count('ملاحظات كاملة') == 40
++    config = audit_column_config()
++    assert set(config) == set(frame.columns)
++    assert all(column['alignment'] == 'right' for column in config.values())
++    assert config['notes']['width'] >= 400 and config['job_title']['width'] >= 300
++
++
++def test_all_table_columns_have_explicit_alignment_width_and_formatted_dates(monkeypatch):
++    import presentation
++    captured = {}
++    def render(data, **kwargs):
++        captured.update(data=data, **kwargs)
++    monkeypatch.setattr(presentation.st, 'dataframe', render)
++    original = pd.DataFrame({'id': [1], 'title': ['نص كامل'], 'created_at': ['2026-01-01 12:30:59'],
++                             'عدد بطاقات الوصف الوظيفي': [2]})
++    render_table(original)
++    assert captured['hide_index'] and captured['width'] == 'stretch'
++    assert set(captured['column_config']) == set(original.columns)
++    assert captured['column_config']['title']['label'] == 'المسمى الوظيفي'
++    assert captured['column_config']['عدد بطاقات الوصف الوظيفي']['width'] >= 200
++    assert captured['data']['created_at'][0] == '2026-01-01 12:30'
++    assert original['created_at'][0].endswith(':59')
++
++
++def test_css_preserves_icon_fonts_and_grid_geometry():
++    css = get_custom_css()
++    assert "family=Cairo" in css and 'min-width: 320px' in css
++    assert 'margin-top: 20px' in css and '.stDeployButton' in css and '#MainMenu' in css
++    assert 'p, div, span' not in css
++    assert 'stDataFrame"] *' not in css
++    icon_rule = css.split('[data-testid="stIconMaterial"]')[1].split('}')[0]
++    assert 'font-family' not in icon_rule
++    assert 'word-break: normal' in css
++
++
++def test_schedule_formats_structured_timestamps_but_preserves_arabic_day_labels(monkeypatch):
++    import presentation
++    frames = []
++    monkeypatch.setattr(presentation.st, 'dataframe', lambda frame, **kwargs: frames.append(frame))
++    render_table(pd.DataFrame({'اليوم والتاريخ': ['2027-02-24 08:45:59', 'الأحد حسب الاتفاق']}))
++    assert frames[0]['اليوم والتاريخ'].tolist() == ['2027-02-24 08:45', 'الأحد حسب الاتفاق']
++
++
++def login_app(db, username):
++    from streamlit.testing.v1 import AppTest
++    with sqlite3.connect(db) as conn:
++        conn.execute('UPDATE users SET password=?', (auth.hash_password('synthetic-secret'),))
++    app = AppTest.from_file(Path(__file__).resolve().parents[1] / 'app.py', default_timeout=15).run()
++    app.sidebar.text_input[0].input(username)
++    app.sidebar.text_input[1].input('synthetic-secret')
++    app.sidebar.button[0].click().run()
++    assert not app.exception and not app.error
++    return app
++
++
++def test_every_admin_screen_is_reachable_from_sidebar(db):
++    app = login_app(db, 'hr')
++    assert app.sidebar.radio[0].options == list(ADMIN_PAGES.values())
++    assert not app.get('tab')
++    for page in ADMIN_PAGES.values():
++        app.sidebar.radio[0].set_value(page).run()
++        assert not app.exception and not app.error, page
++        assert app.sidebar.radio[0].value == page
++    assert any(button.label == 'إضافة المستخدم' for button in app.button)
++
++
++@pytest.mark.parametrize('username', ['manager', 'staff'])
++def test_member_navigation_keeps_exports_working_and_rejects_admin_route(db, username):
++    app = login_app(db, username)
++    assert app.sidebar.radio[0].options == list(MEMBER_PAGES.values())
++    for page in MEMBER_PAGES.values():
++        app.sidebar.radio[0].set_value(page).run()
++        assert not app.exception and not app.error, page
++    # Seed stale server state before any widget exists; the client serializer
++    # intentionally refuses out-of-range radio values on an existing widget.
++    from streamlit.testing.v1 import AppTest
++    stale = AppTest.from_file(Path(__file__).resolve().parents[1] / 'app.py', default_timeout=15)
++    for key in ('_auth_user_id', '_auth_credential', '_auth_issued_at', '_auth_last_seen'):
++        stale.session_state[key] = app.session_state[key]
++    stale.session_state['primary_navigation'] = ADMIN_PAGES['settings']
++    stale.run()
++    assert not stale.exception and not stale.error
++    assert stale.sidebar.radio[0].value == MEMBER_PAGES['card']
++    assert not any(button.label == 'إضافة المستخدم' for button in stale.button)
++
++
++def test_hidden_screens_do_not_generate_documents_or_read_review_queue(db, monkeypatch):
++    def hidden(*args, **kwargs):
++        pytest.fail('An inactive screen was evaluated')
++    monkeypatch.setattr(docx_parser, 'export_jd_to_docx', hidden)
++    monkeypatch.setattr(database, 'get_pending_modification_requests', hidden)
++    app = login_app(db, 'hr')
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['settings']).run()
++    assert not app.exception and not app.error
++
++
++def test_audit_screen_shows_cleansed_rows_and_full_notes(db):
++    long_note = 'ملاحظات كاملة غير مختصرة ' * 20
++    with sqlite3.connect(db) as conn:
++        conn.execute('''INSERT INTO jd_audit_trail
++            (jd_id,section_name,action,changed_by,changed_at,notes)
++            VALUES(1,'Competencies','approve','admin','2026-10-30T09:45:30Z',?)''', (long_note,))
++    app = login_app(db, 'hr')
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['audit']).run()
++    assert not app.exception and not app.error
++    frame = app.dataframe[0].value
++    assert frame.loc[0, 'action_type'] == 'اعتماد نهائي'
++    assert frame.loc[0, 'actor_name'] == 'مسؤول النظام'
++    assert re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}', frame.loc[0, 'created_at'])
++    assert frame.loc[0, 'notes'] == long_note
++    assert any(long_note.strip() == element.value.strip() for element in app.text)
+--- /dev/null
++++ b/docs/STAGE4_UI_UX.md
+@@ -0,0 +1,60 @@
++# Stage 4 navigation and Arabic presentation
++
++Implemented and verified on 30 October 2026. This is a presentation change; database content, schema, authorization and document interchange contracts are unchanged.
++
++## Modified files
++
++| File | Change |
++|---|---|
++| `app.py` | Replaced top-level horizontal tabs with role-aware sidebar radio navigation. Only the selected screen executes. Admin settings have two short internal tabs for users/permissions and backups, with KPIs above them. Simplified the main banner; added complete audit-record details and escaped before/after text. Every dataframe goes through the shared presentation renderer. |
++| `presentation.py` | New shared navigation labels, Arabic action/field/role labels, timestamp formatting, readable audit notes, explicit audit column schema and a common dataframe renderer with right-aligned text and deliberate widths. Long Arabic numeric headers get wider columns. |
++| `utils.py` | Replaced global font/RTL overrides on every `div`/`span` and every grid descendant with targeted text styles. Preserves native icon fonts and canvas geometry. Adds a 340px desktop sidebar with 320px minimum width, natural identity wrapping, selected/admin navigation emphasis, compact banner/badges, toolbar clearance and production-chrome hiding. |
++| `auth.py` | Compact sidebar brand and profile markup using scoped classes. Existing escaped identity text, session validation and logout remain intact. |
++| `.streamlit/config.toml` | Declares Cairo through Streamlit's theme so native dataframe canvas text also uses it. Uses minimal toolbar mode. Existing telemetry/error masking, CORS/XSRF and disabled magic settings remain in force. |
++| `tests/test_app_smoke.py`; `tests/test_stage2_app.py`; `tests/test_admin_management.py` | Existing workflow tests now select their sidebar screen before interacting. Admin visibility assertions inspect sidebar options rather than removed top-level tabs. The existing 224 cases and their behavior/security checks are retained. |
++| `tests/test_stage4_ui.py` | 24 new cases for all admin/member routes, inactive-screen isolation, stale navigation recovery, Arabic actions/roles/fields, timestamp handling, full audit notes, dataframe column configuration, numeric-header width and icon-safe CSS. |
++| `docs/STAGE4_UI_UX.md` | This change summary and verification record. |
++
++## Navigation and layout
++
++The administrator sidebar exposes all seven requested screens in order: dashboard, card directory, reviews, Word import, interviews, audit history and **⚙️ لوحة الإدارة والإعدادات**. The admin option has a persistent accent. Managers/employees retain their assigned-card, requests, company-directory and Word-export screens; restricted HR/admin workflows are not exposed. All write operations still enforce the verified actor on the server.
++
++Invalid/stale navigation values reset to a valid role-specific screen. Switching to export retains a manager's browsed card while employees remain scoped to their assignment. Accounts without an assignment can still open their requests and the readable company directory.
++
++Only the active top-level screen runs. Navigating to the dashboard/settings no longer generates hidden Word exports or evaluates the review queue. Horizontal tabs are confined to the two short subsections inside admin settings.
++
++Sidebar typography uses normal Arabic word wrapping, adequate padding and a desktop width of 340px (minimum 320px). The responsive CSS constrains the sidebar to the available narrow viewport. The collapsible-sidebar control remains available; deployment, main-menu and footer chrome are hidden.
++
++## Tables and icons
++
++The old `div`/`span` font rule applied Cairo with `!important` to Material icon elements, replacing the icon typeface. The old grid-descendant RTL rule also interfered with native grid internals. Both broad overrides are removed. Cairo is now configured in the theme and scoped to text, while native icon glyphs retain their own fonts.
++
++Native canvas coordinates remain LTR to preserve grid/toolbar geometry; each displayed data column explicitly right-aligns its content. This separates Arabic text alignment from the framework's drawing coordinates. Dataframes have 20px top margin plus toolbar padding, hidden indexes, explicit column configuration and larger row heights.
++
++Audit rows use Arabic action labels such as `تعديل بيانات`, `اعتماد نهائي`, `رفض` and `استيراد بطاقة`. Known role and field codes are translated; existing Arabic names/text are retained. Internal `actor_id`/`version` note labels are displayed readably without discarding their values. This conversion never changes audit rows or hashes in SQLite.
++
++Timestamps display as `YYYY-MM-DD HH:mm`. Aware timestamps are converted to Africa/Cairo; historical naive timestamps retain their clock time because their original timezone is not reconstructed. Empty/invalid timestamps show an explicit label. Structured interview timestamps are formatted, while existing human-written Arabic day labels are preserved.
++
++The audit grid declares all seven columns: record ID, timestamp, title, section, action, actor and notes. Titles and notes receive large widths. Wide records intentionally scroll horizontally instead of squeezing letters into unreadable fragments. The native fullscreen option remains available. The record inspector below the table shows the full title, section, action, notes and before/after content without clipping or substring truncation.
++
++## Verification
++
++- Required command: **248 passed**, no failures/skips, in **26.73 seconds**: all **224 existing + 24 new** cases.
++- `pip check`: **No broken requirements found**.
++- Ninety upstream `importlib.metadata` deprecation warnings were emitted by Streamlit AppTest. As in earlier stages, the full tests ran outside the Windows sandbox's temp/socket restrictions.
++- Real browser QA used a separate synthetic database and a localhost server on port 8510. No real credentials or personnel data were used in browser testing.
++- At **1280 × 720**, all seven admin menu items, including the highlighted settings option, were visible without horizontal navigation truncation. Long Arabic identity/department text wrapped naturally. The admin page displayed its KPIs and two short subsection tabs.
++- The audit grid displayed full Arabic titles and minute-formatted dates in Cairo. The toolbar was separated from its descriptive text. The native column menu was opened: sorting arrows, statistics, autosize, pinning and visibility rendered as icons rather than raw Material glyph names. Deploy/main-menu/footer chrome was absent.
++- Synthetic screenshots are retained locally under `_stage3_work/stage4-ui/`: `admin-screen.png`, `audit-screen.png` and `audit-menu.png`. They are visual QA artifacts and are excluded from the patch.
++- The complete logical SHA-256 of the business database matched its pre-change baseline. All existing values, IDs and history are unchanged: **15 users, 26 cards, 399 responsibilities, 9 interviews and 28 audit events**.
++- `docs/changes/stage4-ui-ux.patch` contains the 10 changed/new text files listed above. It is checked and applied against an isolated pre-Stage-4 baseline, then each reconstructed file is compared to the delivered source. It excludes databases, backups and screenshots.
++
++```powershell
++$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
++.\.venv\Scripts\python -B -m pytest -q
++.\.venv\Scripts\python -m pip check
++```
++
++Restart the Streamlit process to load the theme configuration. Browser refresh then loads the new CSS and navigation. Visual checks covered the desktop viewport above; no screen-reader or physical mobile-device certification is claimed.
++
++The native font configuration follows [Streamlit's custom-font documentation](https://docs.streamlit.io/develop/concepts/configuration/theming-customize-fonts), which also covers dataframe fonts. Cairo continues to load from Google Fonts as requested, with CSS text fallbacks to Tahoma/sans-serif.
