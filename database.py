@@ -16,7 +16,22 @@ from docx_parser import parse_jd_docx
 import governance
 from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
 from upload_security import sanitize_docx_filename
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(dotenv_path=None, **_kwargs):
+        if dotenv_path and os.path.exists(dotenv_path):
+            try:
+                with open(dotenv_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+            except OSError:
+                pass
+        return False
 
 # Try importing psycopg2 for Supabase / PostgreSQL support
 try:
@@ -24,6 +39,7 @@ try:
     from psycopg2.extras import DictCursor
     HAS_PSYCOPG2 = True
 except ImportError:
+    psycopg2 = None
     HAS_PSYCOPG2 = False
     DictCursor = None
 
