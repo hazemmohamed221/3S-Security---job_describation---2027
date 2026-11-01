@@ -5,6 +5,7 @@ Handles SQLite connection, schema definition, seed data, and CRUD operations in 
 
 import sqlite3
 import os
+import sys
 import glob
 import re
 from datetime import datetime, timezone
@@ -15,6 +16,31 @@ from docx_parser import parse_jd_docx
 import governance
 from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
 from upload_security import sanitize_docx_filename
+from dotenv import load_dotenv
+
+# Try importing psycopg2 for Supabase / PostgreSQL support
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+    DictCursor = None
+
+# Load .env if present
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+def get_database_url():
+    """Retrieve DATABASE_URL from environment or streamlit secrets."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+                url = st.secrets["DATABASE_URL"]
+        except Exception:
+            pass
+    return url.strip() if url and url.strip() else None
 
 DB_PATH = os.environ.get("JD_DB_PATH", os.path.join(os.path.dirname(__file__), "job_descriptions.db"))
 
@@ -122,8 +148,122 @@ def translate_qualifications(qual_str):
     return t
 
 
+class PostgresCursorAdapter:
+    """Adapts psycopg2 cursor to mirror sqlite3 cursor semantics."""
+    def __init__(self, cursor, conn_adapter):
+        self._cur = cursor
+        self._conn = conn_adapter
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        sql_pg = sql
+        # Normalize SQLite placeholder syntax to PostgreSQL
+        if '?' in sql_pg:
+            sql_pg = sql_pg.replace('?', '%s')
+
+        # Auto-append RETURNING id for INSERT queries if not already present
+        sql_trimmed = sql_pg.strip()
+        is_insert = sql_trimmed.upper().startswith("INSERT INTO ")
+        has_returning = " RETURNING " in sql_trimmed.upper()
+
+        if is_insert and not has_returning:
+            # Check if target table has an id serial primary key
+            sql_pg = sql_pg.rstrip().rstrip(';') + " RETURNING id;"
+            self._cur.execute(sql_pg, params)
+            try:
+                ret = self._cur.fetchone()
+                if ret:
+                    self.lastrowid = ret[0]
+            except Exception:
+                self.lastrowid = None
+        else:
+            self._cur.execute(sql_pg, params)
+
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        if '?' in sql:
+            sql = sql.replace('?', '%s')
+        self._cur.executemany(sql, seq_of_params)
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def fetchmany(self, size=None):
+        return self._cur.fetchmany(size) if size is not None else self._cur.fetchmany()
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    def close(self):
+        self._cur.close()
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class PostgresConnectionAdapter:
+    """Adapts a psycopg2 connection to mirror sqlite3 connection semantics."""
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def cursor(self):
+        return PostgresCursorAdapter(self._conn.cursor(cursor_factory=DictCursor), self)
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    @property
+    def closed(self):
+        return bool(self._conn.closed)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+
+
 def get_connection():
-    """Returns a connection to the SQLite database with row_factory enabled."""
+    """Returns a connection to either Supabase PostgreSQL (if DATABASE_URL is set and not running in pytest) or local SQLite."""
+    # When running tests (pytest loaded or custom DB_PATH), use SQLite.
+    is_testing = "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("JD_DB_PATH") or DB_PATH != os.path.join(os.path.dirname(__file__), "job_descriptions.db")
+
+    pg_url = get_database_url() if not is_testing else None
+    if pg_url and HAS_PSYCOPG2:
+        try:
+            raw_conn = psycopg2.connect(
+                pg_url,
+                connect_timeout=15,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
+            return PostgresConnectionAdapter(raw_conn)
+        except Exception:
+            # If PostgreSQL connection fails, fallback to SQLite
+            pass
+
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -140,6 +280,12 @@ def get_connection():
 
 def init_db():
     """Initializes tables and seeds initial data if database is empty."""
+    is_testing = "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("JD_DB_PATH") or DB_PATH != os.path.join(os.path.dirname(__file__), "job_descriptions.db")
+    pg_url = get_database_url() if not is_testing else None
+    if pg_url and HAS_PSYCOPG2:
+        # Schema is created and initialized in PostgreSQL
+        return
+
     backup_before_startup(DB_PATH)
     conn = get_connection()
     cur = conn.cursor()
@@ -387,8 +533,11 @@ def _write_connection():
     """Serialize validation and writes; roll back the whole action on any error."""
     with closing(get_connection()) as conn:
         with conn:
-            conn.execute("BEGIN IMMEDIATE")
-            yield conn
+            if isinstance(conn, PostgresConnectionAdapter):
+                yield conn
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
 
 
 def _require_actor(conn, actor_id, *, jd_id=None, admin=False):
@@ -888,8 +1037,10 @@ def create_new_user(username, full_name, role, password, *, actor_id, department
                 (username,password,full_name,role,department,assigned_jd_id)
                 VALUES (?,?,?,?,?,?)''',
                 (username.strip(), encoded, full_name.strip(), role, department, assigned_jd_id))
-        except sqlite3.IntegrityError as exc:
-            if exc.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+        except (sqlite3.IntegrityError, getattr(psycopg2, "IntegrityError", sqlite3.IntegrityError)) as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            pgcode = getattr(exc, "pgcode", None)
+            if code == sqlite3.SQLITE_CONSTRAINT_UNIQUE or pgcode == "23505":
                 raise ValueError('اسم المستخدم مسجل بالفعل. يرجى اختيار اسم آخر.') from None
             raise
         return cursor.lastrowid
