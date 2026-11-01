@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.db-*
+*.sqlite*
+data/backups/
+_stage1_work/
+.env
+.streamlit/secrets.toml
+job describation/
+*.xlsx

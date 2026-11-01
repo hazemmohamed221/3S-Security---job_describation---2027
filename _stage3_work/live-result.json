@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "users": 15,
+    "job_descriptions": 26,
+    "accountabilities": 399,
+    "modification_requests": 1,
+    "jd_audit_trail": 28,
+    "interview_schedule": 9
+  },
+  "pragmas": {
+    "foreign_keys": 1,
+    "journal_mode": "wal",
+    "synchronous": 1
+  },
+  "preupgrade_backup": "D:\\hazem\\projects\\3S Security - job_describation - 2027\\data\\backups\\job_descriptions_20261030T093751.657809Z_43257de7.db",
+  "verified_stage3_backup": "D:\\hazem\\projects\\3S Security - job_describation - 2027\\data\\backups\\job_descriptions_20261030T094410.045767Z_20b22bdd.db",
+  "pruned_backups": 0,
+  "all_values_ids_sequences_preserved": true,
+  "verified_business_restore": true
+}

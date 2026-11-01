@@ -1,16 +1,8 @@
-.venv/
+﻿.venv/
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
-*.db
-*.db-*
-*.db.sha256
-*.sqlite*
 data/backups/
-_stage1_work/
-_stage2_work/
-_stage3_work/
-.env
-.streamlit/secrets.toml
-job describation/
-*.xlsx
+*.log
+.DS_Store
+Thumbs.db

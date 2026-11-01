@@ -1,0 +1,14 @@
+database.py
+app.py
+docx_parser.py
+tests/conftest.py
+.gitignore
+.dockerignore
+governance.py
+docx_format.py
+scripts/migrate_integrity.py
+scripts/verify_stage2_migration.py
+tests/test_stage2_integrity.py
+tests/test_stage2_docx.py
+tests/test_stage2_app.py
+docs/STAGE2_INTEGRITY.md

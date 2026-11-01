@@ -1,0 +1,16 @@
+{
+  "migrated_credentials": 15,
+  "credentials_verified": 15,
+  "row_counts": {
+    "users": 15,
+    "sqlite_sequence": 6,
+    "job_descriptions": 26,
+    "accountabilities": 399,
+    "modification_requests": 1,
+    "jd_audit_trail": 28,
+    "interview_schedule": 9
+  },
+  "schema_preserved": true,
+  "all_noncredential_values_preserved": true,
+  "backup": "D:\\hazem\\projects\\3S Security - job_describation - 2027\\data\\backups\\job_descriptions_20261030T083344.046293Z_04bad736.db"
+}
