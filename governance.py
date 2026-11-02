@@ -70,12 +70,20 @@ def migrate(conn):
                 new_review_columns |= table == 'job_descriptions' and name == 'review_hash'
 
     def trigger(name, timing, body):
-        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {name} {timing} BEGIN {body} END')
+        sql = f'CREATE TRIGGER {name} {timing} BEGIN {body} END'
+        existing = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+        if existing and existing[0] == sql:
+            return
+        if existing:
+            conn.execute(f'DROP TRIGGER {name}')
+        conn.execute(sql)
 
     dirty = ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in CONTENT_FIELDS)
     trigger('stage2_card_revision',
             f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions WHEN {dirty}',
-            "UPDATE job_descriptions SET version=OLD.version+1,status='قيد المراجعة',"
+            "UPDATE job_descriptions SET version=OLD.version+1,status=CASE "
+            "WHEN OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة' AND NEW.version=OLD.version+1 "
+            "THEN 'مسودة' ELSE 'قيد المراجعة' END,"
             "review_version=NULL,review_hash=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=NEW.id;")
     trigger('stage2_version_guard', 'BEFORE UPDATE OF version ON job_descriptions WHEN NEW.version < OLD.version',
             "SELECT RAISE(ABORT,'Revision cannot decrease');")
@@ -96,7 +104,9 @@ def migrate(conn):
     valid = (f"({old}={new}) OR ({old}='مسودة' AND {new}='قيد المراجعة') OR "
              f"({old}='قيد المراجعة' AND {new} IN ('معتمد','مرفوض')) OR "
              f"({old}='مرفوض' AND {new}='قيد المراجعة') OR "
-             f"({old}='معتمد' AND {new}='قيد المراجعة' AND NEW.version>OLD.version)")
+             f"({old}='معتمد' AND {new}='قيد المراجعة' AND NEW.version>OLD.version) OR "
+             f"({old}='معتمد' AND {new}='مسودة' AND NEW.version=OLD.version+1 "
+             "AND NEW.review_version IS NULL AND NEW.review_hash IS NULL)")
     trigger('stage2_status_guard', f'BEFORE UPDATE OF status ON job_descriptions WHEN ({new}) IS NULL OR NOT ({valid})',
             "SELECT RAISE(ABORT,'Invalid document state transition');")
     for operation in ('UPDATE', 'DELETE'):

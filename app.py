@@ -16,6 +16,7 @@ import database
 import docx_parser
 import utils
 import auth
+from roles import JD_EDIT_ROLES, ROLE_LABELS
 from presentation import (ADMIN_PAGES, MEMBER_PAGES, render_table, audit_dataframe, audit_column_config,
                           format_timestamp, arabic_action, arabic_field, readable_notes)
 from statuses import CardStatus, InterviewStatus
@@ -28,10 +29,91 @@ def _run_write(operation, *args, **kwargs):
     except (PermissionError, ValueError) as exc:
         st.error(str(exc))
         st.stop()
-    except (OSError, sqlite3.Error, RuntimeError):
+    except (OSError, sqlite3.Error, RuntimeError, getattr(database.psycopg2, 'Error', sqlite3.Error)):
         logging.getLogger(__name__).exception("Governance write failed")
         st.error("تعذر حفظ التغيير. لم يتم اعتماد العملية. يرجى المحاولة مجدداً.")
         st.stop()
+
+
+def render_jd_edit_actions(jd, principal):
+    """Confirmed revocation precedes editing; forms are bound to a displayed revision."""
+    if principal['role'] not in JD_EDIT_ROLES:
+        return
+    if flash := st.session_state.pop('_jd_edit_flash', None):
+        st.toast(flash, icon='✅')
+        st.success(flash)
+    active = st.session_state.get('_jd_action_base')
+    if active and active['card_id'] != jd['id']:
+        st.session_state.pop('_jd_action_base', None)
+        active = None
+    if active and active['version'] != jd['version']:
+        st.warning('تغير إصدار البطاقة منذ فتح النموذج. لم يتم حفظ مدخلات الإصدار القديم.')
+        if st.button('تحميل الإصدار الحالي وإغلاق النموذج القديم'):
+            st.session_state.pop('_jd_action_base', None)
+            st.rerun()
+        return
+    state = CardStatus.parse(jd['status'])
+    token = f"{jd['id']}_{jd['version']}"
+    if state == CardStatus.APPROVED:
+        st.warning('⚠️ البطاقة معتمدة رسمياً. لإجراء تعديلات، يجب إلغاء الاعتماد أولاً.')
+        if st.button('🔄 إلغاء الاعتماد وفتح التعديل', key=f'revoke_open_{token}'):
+            st.session_state['_jd_action_base'] = {'card_id': jd['id'], 'version': jd['version']}
+            st.session_state[f'revoke_confirm_{token}'] = True
+        if st.session_state.get(f'revoke_confirm_{token}'):
+            with st.expander('تأكيد إلغاء اعتماد البطاقة', expanded=True):
+                with st.form(f'revoke_form_{token}'):
+                    reason = st.text_area('سبب إلغاء الاعتماد', key=f'revoke_reason_{token}')
+                    confirm = st.form_submit_button('تأكيد إلغاء الاعتماد', type='primary')
+                    cancel = st.form_submit_button('إلغاء')
+                if cancel:
+                    st.session_state.pop('_jd_action_base', None)
+                    st.session_state.pop(f'revoke_confirm_{token}', None)
+                    st.rerun()
+                if confirm:
+                    ok, message = _run_write(database.revoke_jd_approval, jd['id'], principal['id'],
+                                              principal['full_name'], reason, expected_version=jd['version'])
+                    if ok:
+                        st.session_state.pop('_jd_action_base', None)
+                        st.session_state.pop(f'revoke_confirm_{token}', None)
+                        st.session_state['_jd_edit_flash'] = message
+                        st.session_state['_jd_saved_card_id'] = jd['id']
+                        st.rerun()
+                    st.error(message)
+    elif state == CardStatus.DRAFT:
+        if st.button('✏️ تعديل بيانات البطاقة', key=f'core_open_{token}'):
+            st.session_state['_jd_action_base'] = {'card_id': jd['id'], 'version': jd['version']}
+            st.session_state[f'core_edit_{token}'] = True
+        if st.session_state.get(f'core_edit_{token}'):
+            with st.expander('تعديل بيانات الوصف الوظيفي', expanded=True):
+                with st.form(f'core_form_{token}'):
+                    fields = {}
+                    for name, label in (('title', 'المسمى الوظيفي'), ('department', 'الإدارة'),
+                                        ('sector', 'القطاع'), ('reports_to', 'المسؤول المباشر')):
+                        fields[name] = st.text_input(label, value=jd[name] or '', key=f'core_{name}_{token}')
+                    fields['purpose'] = st.text_area('الهدف العام من الوظيفة', value=jd['purpose'] or '',
+                                                     key=f'core_purpose_{token}')
+                    fields['qualifications'] = st.text_area('المؤهلات العلمية ومتطلبات الخبرة والمهارات',
+                        value=jd['qualifications'] or '', key=f'core_qualifications_{token}')
+                    save = st.form_submit_button('حفظ بيانات البطاقة', type='primary')
+                    cancel = st.form_submit_button('إلغاء التعديل')
+                if cancel:
+                    st.session_state.pop('_jd_action_base', None)
+                    st.session_state.pop(f'core_edit_{token}', None)
+                    st.rerun()
+                if save:
+                    changes = {name: value for name, value in fields.items() if value != (jd[name] or '')}
+                    if not changes:
+                        st.info('لا توجد تغييرات للحفظ.')
+                    else:
+                        ok, message = _run_write(database.update_jd_core_info, jd['id'], principal['id'],
+                            principal['full_name'], changes, expected_version=jd['version'])
+                        if ok:
+                            st.session_state.pop('_jd_action_base', None)
+                            st.session_state.pop(f'core_edit_{token}', None)
+                            st.session_state['_jd_edit_flash'] = message
+                            st.session_state['_jd_saved_card_id'] = jd['id']
+                            st.rerun()
+                        st.error(message)
 
 
 def render_admin_settings():
@@ -55,7 +137,7 @@ def render_admin_settings():
 
     users_tab, backups_tab = st.tabs(['المستخدمون والصلاحيات', 'النسخ الاحتياطي'])
     with users_tab:
-        roles = {'employee': 'موظف', 'manager': 'مدير إدارة', 'admin': 'مسؤول النظام'}
+        roles = ROLE_LABELS
         st.markdown('#### إضافة مستخدم جديد')
         st.caption('كلمة المرور من 12 إلى 1024 حرفاً. الحساب الجديد لا يحصل على بطاقة مخصصة تلقائياً.')
         with st.form('admin_create_user', clear_on_submit=True):
@@ -210,7 +292,7 @@ st.markdown(f"""
     </div>
     <div style="text-align: left; flex-shrink: 0; max-width: 100%; box-sizing: border-box;">
         <span class="status-badge {'badge-approved' if is_admin else 'badge-pending'}" style="font-size: 0.9rem; padding: 6px 16px;">
-            {'👑 إدارة الموارد البشرية / مسؤول النظام' if is_admin else ('👔 مدير إدارة' if is_manager else '👷 موظف')}
+            {ROLE_LABELS[user['role']]}
         </span>
     </div>
 </div>
@@ -219,11 +301,12 @@ st.markdown(f"""
 # -------------------------------------------------------------
 # ADMIN / HR MANAGER (ROLE B) INTERFACE
 # -------------------------------------------------------------
-if is_admin:
-    if st.session_state.get('primary_navigation') not in ADMIN_PAGES.values():
+if user['role'] in JD_EDIT_ROLES:
+    available_pages = ADMIN_PAGES if is_admin else {'directory': ADMIN_PAGES['directory']}
+    if st.session_state.get('primary_navigation') not in available_pages.values():
         st.session_state.pop('primary_navigation', None)
-    selected_page = st.sidebar.radio('التنقل الرئيسي', list(ADMIN_PAGES.values()), key='primary_navigation')
-    page = next(key for key, label in ADMIN_PAGES.items() if label == selected_page)
+    selected_page = st.sidebar.radio('التنقل الرئيسي', list(available_pages.values()), key='primary_navigation')
+    page = next(key for key, label in available_pages.items() if label == selected_page)
 
     if page == 'settings':
         render_admin_settings()
@@ -442,15 +525,21 @@ if is_admin:
     if page == 'directory':
         st.subheader("📁 الدليل الشامل لبطاقات الوصف الوظيفي")
         all_jds = database.get_all_jds()
+        saved_card_id = st.session_state.pop('_jd_saved_card_id', None)
+        if saved_card_id is not None:
+            st.session_state['directory_jd_id'] = saved_card_id
+            st.session_state['directory_search'] = ''
+            st.session_state['directory_department'] = 'كافة الإدارات'
+            st.session_state['directory_status'] = 'كافة الحالات'
 
         fcol1, fcol2, fcol3 = st.columns([3, 2, 2])
-        search_kw = fcol1.text_input("🔍 البحث باسم الوظيفة أو الكلمات المفتاحية", placeholder="مثال: مشروعات، مبيعات، جودة، مخازن...")
+        search_kw = fcol1.text_input("🔍 البحث باسم الوظيفة أو الكلمات المفتاحية", placeholder="مثال: مشروعات، مبيعات، جودة، مخازن...", key='directory_search')
         
         dept_list = ["كافة الإدارات"] + sorted(list({j['department'] for j in all_jds if j['department']}))
-        selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list)
+        selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list, key='directory_department')
         
         status_list = ["كافة الحالات", *(status.value for status in CardStatus)]
-        selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list)
+        selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list, key='directory_status')
 
         filtered_jds = all_jds
         if search_kw:
@@ -462,13 +551,17 @@ if is_admin:
 
         st.caption(f"يتم عرض **{len(filtered_jds)}** من أصل **{len(all_jds)}** بطاقة وصف وظيفي")
 
-        jd_options = {f"{j['title']} ({j['department'] or 'الإدارة العامة'})": j['id'] for j in filtered_jds}
+        jd_options = {j['id']: f"#{j['id']} — {j['title']} ({j['department'] or 'الإدارة العامة'})" for j in filtered_jds}
         
         if jd_options:
-            selected_jd_label = st.selectbox("اختر بطاقة الوصف الوظيفي لعرض كافة تفاصيلها:", list(jd_options.keys()))
-            chosen_jd_id = jd_options[selected_jd_label]
+            if st.session_state.get('directory_jd_id') not in jd_options:
+                st.session_state.pop('directory_jd_id', None)
+            chosen_jd_id = st.selectbox("اختر بطاقة الوصف الوظيفي لعرض كافة تفاصيلها:", list(jd_options),
+                                        format_func=jd_options.get, key='directory_jd_id')
             jd = database.get_jd_by_id(chosen_jd_id)
             accountabilities = database.get_accountabilities(chosen_jd_id)
+
+            render_jd_edit_actions(jd, user)
 
             st.markdown("---")
             head_col1, head_col2 = st.columns([3, 1])
@@ -514,7 +607,7 @@ if is_admin:
             st.markdown(f"""
             <div class="jd-section-card">
                 <div class="jd-section-title">٣. الهدف العام من الوظيفة</div>
-                <div>{jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.'}</div>
+                <div style="white-space: pre-line;">{escape(jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.')}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -547,7 +640,7 @@ if is_admin:
                 st.markdown(f"""
                 <div class="jd-section-card">
                     <div class="jd-section-title">٦. المؤهلات والخبرات والمهارات المطلوبة</div>
-                    <div style="white-space: pre-line;">{jd['qualifications']}</div>
+                    <div style="white-space: pre-line;">{escape(jd['qualifications'])}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -824,7 +917,7 @@ else:
         st.markdown(f"""
         <div class="jd-section-card">
             <div class="jd-section-title">٣. الهدف العام من الوظيفة</div>
-            <div>{jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.'}</div>
+            <div style="white-space: pre-line;">{escape(jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.')}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -854,7 +947,7 @@ else:
             st.markdown(f"""
             <div class="jd-section-card">
                 <div class="jd-section-title">٦. المؤهلات العلمية والخبرات والمهارات المطلوبة</div>
-                <div style="white-space: pre-line;">{jd['qualifications']}</div>
+                <div style="white-space: pre-line;">{escape(jd['qualifications'])}</div>
             </div>
             """, unsafe_allow_html=True)
 

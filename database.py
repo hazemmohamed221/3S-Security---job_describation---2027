@@ -16,6 +16,7 @@ from docx_parser import parse_jd_docx
 import governance
 from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
 from upload_security import sanitize_docx_filename
+from roles import USER_ROLES, JD_EDIT_ROLES
 
 try:
     from dotenv import load_dotenv
@@ -561,7 +562,7 @@ def _require_actor(conn, actor_id, *, jd_id=None, admin=False):
     import auth
     authenticated = auth.require_actor(actor_id)
     actor = conn.execute("SELECT * FROM users WHERE id=?", (authenticated['id'],)).fetchone()
-    if not actor or not dict(actor).get('is_active', 1) or actor['role'] not in ('admin', 'manager', 'employee'):
+    if not actor or not dict(actor).get('is_active', 1) or actor['role'] not in USER_ROLES:
         raise PermissionError("المستخدم غير مخول بإجراء هذا التغيير.")
     if admin and actor['role'] != 'admin':
         raise PermissionError("هذا الإجراء متاح لإدارة الموارد البشرية فقط.")
@@ -827,6 +828,92 @@ def _evidence_values(actor, decision, before, after):
             result, governance.digest(result))
 
 
+CORE_INFO_FIELDS = {'title', 'department', 'sector', 'reports_to', 'purpose', 'qualifications'}
+CORE_INFO_ALIASES = {'job_title': 'title', 'direct_manager': 'reports_to', 'job_purpose': 'purpose'}
+
+
+def _lock_edit_card(conn, card_id, actor_id, expected_version):
+    actor = _require_actor(conn, actor_id)
+    lock = ' FOR UPDATE' if isinstance(conn, PostgresConnectionAdapter) else ''
+    # Keep the account lock before the card lock on PostgreSQL.
+    actor = dict(conn.execute('SELECT * FROM users WHERE id=?' + lock, (actor['id'],)).fetchone())
+    if actor['role'] not in JD_EDIT_ROLES or not actor.get('is_active', 1):
+        raise PermissionError('تعديل بيانات البطاقة وإلغاء اعتمادها متاحان للموارد البشرية ومسؤول النظام فقط.')
+    if type(card_id) is not int:
+        raise ValueError('رقم البطاقة غير صالح.')
+    row = conn.execute('SELECT * FROM job_descriptions WHERE id=?' + lock, (card_id,)).fetchone()
+    if not row:
+        raise ValueError('بطاقة الوصف الوظيفي غير موجودة.')
+    card = dict(row)
+    if expected_version is not None and expected_version != card['version']:
+        raise ValueError('تغير إصدار البطاقة. يرجى إعادة تحميل البيانات قبل الحفظ.')
+    return actor, card
+
+
+def _audit_direct_change(conn, card_id, actor, action, section, old_text, new_text, notes, before):
+    conn.execute('''INSERT INTO jd_audit_trail
+        (jd_id,section_name,action,old_text,new_text,changed_by,notes,changed_at,
+         actor_id,card_version,decision,snapshot_json,snapshot_hash,result_json,result_hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (card_id, section, action, old_text, new_text, actor['full_name'], notes, _utc_now(),
+         *_evidence_values(actor, action, before, governance.snapshot(conn, card_id))))
+
+
+def revoke_jd_approval(card_id: int, actor_id: int, actor_name: str, reason: str,
+                       *, expected_version=None) -> tuple[bool, str]:
+    """Reopen exactly one approved revision. Actor attribution comes from the session/DB."""
+    try:
+        with _write_connection() as conn:
+            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError('سبب إلغاء الاعتماد مطلوب.')
+            if CardStatus.parse(card['status']) != CardStatus.APPROVED:
+                raise ValueError('لا يمكن إلغاء الاعتماد إلا لبطاقة معتمدة رسمياً.')
+            before = governance.snapshot(conn, card_id)
+            conn.execute('''UPDATE job_descriptions SET status=?,version=version+1,
+                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
+                (CardStatus.DRAFT.value, _utc_now(), card_id))
+            _audit_direct_change(conn, card_id, actor, 'revoke_approval', 'حالة الوثيقة',
+                                 card['status'], CardStatus.DRAFT.value, reason, before)
+    except (PermissionError, ValueError) as exc:
+        return False, str(exc)
+    return True, 'تم إلغاء الاعتماد وإعادة البطاقة للمسودة وفتح التعديل.'
+
+
+def update_jd_core_info(card_id: int, actor_id: int, actor_name: str, fields: dict,
+                        *, expected_version=None) -> tuple[bool, str]:
+    """Apply an allowlisted partial edit to a Draft, with one revision and immutable evidence."""
+    try:
+        with _write_connection() as conn:
+            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
+            if CardStatus.parse(card['status']) != CardStatus.DRAFT:
+                raise ValueError('التعديل المباشر متاح للمسودة فقط. يجب إلغاء الاعتماد أولاً.')
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError('يرجى تحديد بيانات البطاقة المطلوب تعديلها.')
+            normalized = {}
+            for name, value in fields.items():
+                field = CORE_INFO_ALIASES.get(name, name)
+                if field not in CORE_INFO_FIELDS or field in normalized or not isinstance(value, str):
+                    raise ValueError('تتضمن البيانات حقلاً غير مسموح أو قيمة غير صالحة.')
+                if field == 'title' and not value.strip():
+                    raise ValueError('المسمى الوظيفي مطلوب.')
+                normalized[field] = value
+            changed = {name: value for name, value in normalized.items() if value != card[name]}
+            if not changed:
+                return True, 'لا توجد تغييرات للحفظ.'
+            before = governance.snapshot(conn, card_id)
+            assignments = ','.join(f'{name}=?' for name in changed)
+            conn.execute(f'''UPDATE job_descriptions SET {assignments},version=version+1,status=?,
+                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
+                (*changed.values(), CardStatus.DRAFT.value, _utc_now(), card_id))
+            _audit_direct_change(conn, card_id, actor, 'update', 'بيانات البطاقة الأساسية',
+                                 governance.encode({name: card[name] for name in changed}),
+                                 governance.encode(changed), 'تعديل مباشر لبيانات المسودة', before)
+    except (PermissionError, ValueError) as exc:
+        return False, str(exc)
+    return True, 'تم تحديث بيانات البطاقة وتسجيل التعديلات بنجاح.'
+
+
 def request_jd_review(jd_id, *, actor_id):
     with _write_connection() as conn:
         _require_actor(conn, actor_id, jd_id=jd_id)
@@ -889,14 +976,14 @@ def get_audit_trail(jd_id=None):
         FROM jd_audit_trail a
         JOIN job_descriptions j ON a.jd_id = j.id
         WHERE a.jd_id = ?
-        ORDER BY a.changed_at DESC
+        ORDER BY a.changed_at DESC,a.id DESC
         """, (jd_id,))
     else:
         cur.execute("""
         SELECT a.*, j.title as jd_title
         FROM jd_audit_trail a
         JOIN job_descriptions j ON a.jd_id = j.id
-        ORDER BY a.changed_at DESC
+        ORDER BY a.changed_at DESC,a.id DESC
         """)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -1039,7 +1126,7 @@ def create_new_user(username, full_name, role, password, *, actor_id, department
             raise ValueError('اسم المستخدم مطلوب، ويسمح بالحروف والأرقام والنقطة والشرطة و@ فقط.')
         if not isinstance(full_name, str) or not full_name.strip() or len(full_name.strip()) > 150:
             raise ValueError('يرجى إدخال الاسم الكامل بما لا يتجاوز 150 حرفاً.')
-        if role not in ('admin', 'manager', 'employee'):
+        if role not in USER_ROLES:
             raise ValueError('دور المستخدم غير صالح.')
         _validate_new_password(password)
         if assigned_jd_id is not None and (type(assigned_jd_id) is not int or not conn.execute(

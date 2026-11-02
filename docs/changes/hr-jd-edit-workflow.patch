@@ -1,0 +1,1121 @@
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,6 @@
+ .env
+ .env.*
+ !.env.example
++_stage3_work/hr-jd-edit/
++*.db-wal
++*.db-shm
+diff --git a/database.py b/database.py
+--- a/database.py
++++ b/database.py
+@@ -16,6 +16,7 @@
+ import governance
+ from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
+ from upload_security import sanitize_docx_filename
++from roles import USER_ROLES, JD_EDIT_ROLES
+ 
+ try:
+     from dotenv import load_dotenv
+@@ -561,7 +562,7 @@
+     import auth
+     authenticated = auth.require_actor(actor_id)
+     actor = conn.execute("SELECT * FROM users WHERE id=?", (authenticated['id'],)).fetchone()
+-    if not actor or not dict(actor).get('is_active', 1) or actor['role'] not in ('admin', 'manager', 'employee'):
++    if not actor or not dict(actor).get('is_active', 1) or actor['role'] not in USER_ROLES:
+         raise PermissionError("المستخدم غير مخول بإجراء هذا التغيير.")
+     if admin and actor['role'] != 'admin':
+         raise PermissionError("هذا الإجراء متاح لإدارة الموارد البشرية فقط.")
+@@ -827,6 +828,92 @@
+             result, governance.digest(result))
+ 
+ 
++CORE_INFO_FIELDS = {'title', 'department', 'sector', 'reports_to', 'purpose', 'qualifications'}
++CORE_INFO_ALIASES = {'job_title': 'title', 'direct_manager': 'reports_to', 'job_purpose': 'purpose'}
++
++
++def _lock_edit_card(conn, card_id, actor_id, expected_version):
++    actor = _require_actor(conn, actor_id)
++    lock = ' FOR UPDATE' if isinstance(conn, PostgresConnectionAdapter) else ''
++    # Keep the account lock before the card lock on PostgreSQL.
++    actor = dict(conn.execute('SELECT * FROM users WHERE id=?' + lock, (actor['id'],)).fetchone())
++    if actor['role'] not in JD_EDIT_ROLES or not actor.get('is_active', 1):
++        raise PermissionError('تعديل بيانات البطاقة وإلغاء اعتمادها متاحان للموارد البشرية ومسؤول النظام فقط.')
++    if type(card_id) is not int:
++        raise ValueError('رقم البطاقة غير صالح.')
++    row = conn.execute('SELECT * FROM job_descriptions WHERE id=?' + lock, (card_id,)).fetchone()
++    if not row:
++        raise ValueError('بطاقة الوصف الوظيفي غير موجودة.')
++    card = dict(row)
++    if expected_version is not None and expected_version != card['version']:
++        raise ValueError('تغير إصدار البطاقة. يرجى إعادة تحميل البيانات قبل الحفظ.')
++    return actor, card
++
++
++def _audit_direct_change(conn, card_id, actor, action, section, old_text, new_text, notes, before):
++    conn.execute('''INSERT INTO jd_audit_trail
++        (jd_id,section_name,action,old_text,new_text,changed_by,notes,changed_at,
++         actor_id,card_version,decision,snapshot_json,snapshot_hash,result_json,result_hash)
++        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
++        (card_id, section, action, old_text, new_text, actor['full_name'], notes, _utc_now(),
++         *_evidence_values(actor, action, before, governance.snapshot(conn, card_id))))
++
++
++def revoke_jd_approval(card_id: int, actor_id: int, actor_name: str, reason: str,
++                       *, expected_version=None) -> tuple[bool, str]:
++    """Reopen exactly one approved revision. Actor attribution comes from the session/DB."""
++    try:
++        with _write_connection() as conn:
++            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
++            if not isinstance(reason, str) or not reason.strip():
++                raise ValueError('سبب إلغاء الاعتماد مطلوب.')
++            if CardStatus.parse(card['status']) != CardStatus.APPROVED:
++                raise ValueError('لا يمكن إلغاء الاعتماد إلا لبطاقة معتمدة رسمياً.')
++            before = governance.snapshot(conn, card_id)
++            conn.execute('''UPDATE job_descriptions SET status=?,version=version+1,
++                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
++                (CardStatus.DRAFT.value, _utc_now(), card_id))
++            _audit_direct_change(conn, card_id, actor, 'revoke_approval', 'حالة الوثيقة',
++                                 card['status'], CardStatus.DRAFT.value, reason, before)
++    except (PermissionError, ValueError) as exc:
++        return False, str(exc)
++    return True, 'تم إلغاء الاعتماد وإعادة البطاقة للمسودة وفتح التعديل.'
++
++
++def update_jd_core_info(card_id: int, actor_id: int, actor_name: str, fields: dict,
++                        *, expected_version=None) -> tuple[bool, str]:
++    """Apply an allowlisted partial edit to a Draft, with one revision and immutable evidence."""
++    try:
++        with _write_connection() as conn:
++            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
++            if CardStatus.parse(card['status']) != CardStatus.DRAFT:
++                raise ValueError('التعديل المباشر متاح للمسودة فقط. يجب إلغاء الاعتماد أولاً.')
++            if not isinstance(fields, dict) or not fields:
++                raise ValueError('يرجى تحديد بيانات البطاقة المطلوب تعديلها.')
++            normalized = {}
++            for name, value in fields.items():
++                field = CORE_INFO_ALIASES.get(name, name)
++                if field not in CORE_INFO_FIELDS or field in normalized or not isinstance(value, str):
++                    raise ValueError('تتضمن البيانات حقلاً غير مسموح أو قيمة غير صالحة.')
++                if field == 'title' and not value.strip():
++                    raise ValueError('المسمى الوظيفي مطلوب.')
++                normalized[field] = value
++            changed = {name: value for name, value in normalized.items() if value != card[name]}
++            if not changed:
++                return True, 'لا توجد تغييرات للحفظ.'
++            before = governance.snapshot(conn, card_id)
++            assignments = ','.join(f'{name}=?' for name in changed)
++            conn.execute(f'''UPDATE job_descriptions SET {assignments},version=version+1,status=?,
++                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
++                (*changed.values(), CardStatus.DRAFT.value, _utc_now(), card_id))
++            _audit_direct_change(conn, card_id, actor, 'update', 'بيانات البطاقة الأساسية',
++                                 governance.encode({name: card[name] for name in changed}),
++                                 governance.encode(changed), 'تعديل مباشر لبيانات المسودة', before)
++    except (PermissionError, ValueError) as exc:
++        return False, str(exc)
++    return True, 'تم تحديث بيانات البطاقة وتسجيل التعديلات بنجاح.'
++
++
+ def request_jd_review(jd_id, *, actor_id):
+     with _write_connection() as conn:
+         _require_actor(conn, actor_id, jd_id=jd_id)
+@@ -889,14 +976,14 @@
+         FROM jd_audit_trail a
+         JOIN job_descriptions j ON a.jd_id = j.id
+         WHERE a.jd_id = ?
+-        ORDER BY a.changed_at DESC
++        ORDER BY a.changed_at DESC,a.id DESC
+         """, (jd_id,))
+     else:
+         cur.execute("""
+         SELECT a.*, j.title as jd_title
+         FROM jd_audit_trail a
+         JOIN job_descriptions j ON a.jd_id = j.id
+-        ORDER BY a.changed_at DESC
++        ORDER BY a.changed_at DESC,a.id DESC
+         """)
+     rows = [dict(r) for r in cur.fetchall()]
+     conn.close()
+@@ -1039,7 +1126,7 @@
+             raise ValueError('اسم المستخدم مطلوب، ويسمح بالحروف والأرقام والنقطة والشرطة و@ فقط.')
+         if not isinstance(full_name, str) or not full_name.strip() or len(full_name.strip()) > 150:
+             raise ValueError('يرجى إدخال الاسم الكامل بما لا يتجاوز 150 حرفاً.')
+-        if role not in ('admin', 'manager', 'employee'):
++        if role not in USER_ROLES:
+             raise ValueError('دور المستخدم غير صالح.')
+         _validate_new_password(password)
+         if assigned_jd_id is not None and (type(assigned_jd_id) is not int or not conn.execute(
+diff --git a/auth.py b/auth.py
+--- a/auth.py
++++ b/auth.py
+@@ -9,6 +9,7 @@
+ import html
+ import time
+ from password_security import hash_password, verify_password
++from roles import USER_ROLES, JD_EDIT_ROLES, ROLE_LABELS
+ 
+ IDLE_SECONDS = 30 * 60
+ MAX_SESSION_SECONDS = 12 * 60 * 60
+@@ -40,7 +41,7 @@
+         _clear_session()
+         return None
+     user = database.get_user_by_id(principal_id)
+-    if (not user or not user.get('is_active', 1) or user['role'] not in ('admin', 'manager', 'employee')
++    if (not user or not user.get('is_active', 1) or user['role'] not in USER_ROLES
+             or state.get('_auth_credential') != _credential_fingerprint(user)):
+         _clear_session()
+         return None
+@@ -50,7 +51,8 @@
+     state.user_info = public
+     state['user'] = public
+     state.role = public['role']
+-    state.permissions = ('review', 'import', 'schedule', 'all_cards') if public['role'] == 'admin' else ('assigned_card',)
++    state.permissions = (('review', 'import', 'schedule', 'all_cards') if public['role'] == 'admin'
++                         else ('edit_jd', 'all_cards') if public['role'] in JD_EDIT_ROLES else ('assigned_card',))
+     state['_auth_last_seen'] = now
+     return public
+ 
+@@ -74,7 +76,7 @@
+     user = database.get_user_by_username(username)
+     valid = user and verify_password(user['password'], password)
+     _clear_session()
+-    if valid and user.get('is_active', 1) and user['role'] in ('admin', 'manager', 'employee'):
++    if valid and user.get('is_active', 1) and user['role'] in USER_ROLES:
+         st.session_state['_auth_user_id'] = user['id']
+         st.session_state['_auth_credential'] = _credential_fingerprint(user)
+         st.session_state['_auth_issued_at'] = time.time()
+@@ -126,7 +128,7 @@
+         """)
+     else:
+         user = get_authenticated_user()
+-        role_label = "إدارة الموارد البشرية / مسؤول النظام" if user['role'] == 'admin' else ("مدير إدارة" if user['role'] == 'manager' else "موظف")
++        role_label = ROLE_LABELS[user['role']]
+         badge_class = "badge-approved" if user['role'] == 'admin' else "badge-pending"
+ 
+         st.sidebar.markdown(f"""
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -16,6 +16,7 @@
+ import docx_parser
+ import utils
+ import auth
++from roles import JD_EDIT_ROLES, ROLE_LABELS
+ from presentation import (ADMIN_PAGES, MEMBER_PAGES, render_table, audit_dataframe, audit_column_config,
+                           format_timestamp, arabic_action, arabic_field, readable_notes)
+ from statuses import CardStatus, InterviewStatus
+@@ -28,10 +29,91 @@
+     except (PermissionError, ValueError) as exc:
+         st.error(str(exc))
+         st.stop()
+-    except (OSError, sqlite3.Error, RuntimeError):
++    except (OSError, sqlite3.Error, RuntimeError, getattr(database.psycopg2, 'Error', sqlite3.Error)):
+         logging.getLogger(__name__).exception("Governance write failed")
+         st.error("تعذر حفظ التغيير. لم يتم اعتماد العملية. يرجى المحاولة مجدداً.")
+         st.stop()
++
++
++def render_jd_edit_actions(jd, principal):
++    """Confirmed revocation precedes editing; forms are bound to a displayed revision."""
++    if principal['role'] not in JD_EDIT_ROLES:
++        return
++    if flash := st.session_state.pop('_jd_edit_flash', None):
++        st.toast(flash, icon='✅')
++        st.success(flash)
++    active = st.session_state.get('_jd_action_base')
++    if active and active['card_id'] != jd['id']:
++        st.session_state.pop('_jd_action_base', None)
++        active = None
++    if active and active['version'] != jd['version']:
++        st.warning('تغير إصدار البطاقة منذ فتح النموذج. لم يتم حفظ مدخلات الإصدار القديم.')
++        if st.button('تحميل الإصدار الحالي وإغلاق النموذج القديم'):
++            st.session_state.pop('_jd_action_base', None)
++            st.rerun()
++        return
++    state = CardStatus.parse(jd['status'])
++    token = f"{jd['id']}_{jd['version']}"
++    if state == CardStatus.APPROVED:
++        st.warning('⚠️ البطاقة معتمدة رسمياً. لإجراء تعديلات، يجب إلغاء الاعتماد أولاً.')
++        if st.button('🔄 إلغاء الاعتماد وفتح التعديل', key=f'revoke_open_{token}'):
++            st.session_state['_jd_action_base'] = {'card_id': jd['id'], 'version': jd['version']}
++            st.session_state[f'revoke_confirm_{token}'] = True
++        if st.session_state.get(f'revoke_confirm_{token}'):
++            with st.expander('تأكيد إلغاء اعتماد البطاقة', expanded=True):
++                with st.form(f'revoke_form_{token}'):
++                    reason = st.text_area('سبب إلغاء الاعتماد', key=f'revoke_reason_{token}')
++                    confirm = st.form_submit_button('تأكيد إلغاء الاعتماد', type='primary')
++                    cancel = st.form_submit_button('إلغاء')
++                if cancel:
++                    st.session_state.pop('_jd_action_base', None)
++                    st.session_state.pop(f'revoke_confirm_{token}', None)
++                    st.rerun()
++                if confirm:
++                    ok, message = _run_write(database.revoke_jd_approval, jd['id'], principal['id'],
++                                              principal['full_name'], reason, expected_version=jd['version'])
++                    if ok:
++                        st.session_state.pop('_jd_action_base', None)
++                        st.session_state.pop(f'revoke_confirm_{token}', None)
++                        st.session_state['_jd_edit_flash'] = message
++                        st.session_state['_jd_saved_card_id'] = jd['id']
++                        st.rerun()
++                    st.error(message)
++    elif state == CardStatus.DRAFT:
++        if st.button('✏️ تعديل بيانات البطاقة', key=f'core_open_{token}'):
++            st.session_state['_jd_action_base'] = {'card_id': jd['id'], 'version': jd['version']}
++            st.session_state[f'core_edit_{token}'] = True
++        if st.session_state.get(f'core_edit_{token}'):
++            with st.expander('تعديل بيانات الوصف الوظيفي', expanded=True):
++                with st.form(f'core_form_{token}'):
++                    fields = {}
++                    for name, label in (('title', 'المسمى الوظيفي'), ('department', 'الإدارة'),
++                                        ('sector', 'القطاع'), ('reports_to', 'المسؤول المباشر')):
++                        fields[name] = st.text_input(label, value=jd[name] or '', key=f'core_{name}_{token}')
++                    fields['purpose'] = st.text_area('الهدف العام من الوظيفة', value=jd['purpose'] or '',
++                                                     key=f'core_purpose_{token}')
++                    fields['qualifications'] = st.text_area('المؤهلات العلمية ومتطلبات الخبرة والمهارات',
++                        value=jd['qualifications'] or '', key=f'core_qualifications_{token}')
++                    save = st.form_submit_button('حفظ بيانات البطاقة', type='primary')
++                    cancel = st.form_submit_button('إلغاء التعديل')
++                if cancel:
++                    st.session_state.pop('_jd_action_base', None)
++                    st.session_state.pop(f'core_edit_{token}', None)
++                    st.rerun()
++                if save:
++                    changes = {name: value for name, value in fields.items() if value != (jd[name] or '')}
++                    if not changes:
++                        st.info('لا توجد تغييرات للحفظ.')
++                    else:
++                        ok, message = _run_write(database.update_jd_core_info, jd['id'], principal['id'],
++                            principal['full_name'], changes, expected_version=jd['version'])
++                        if ok:
++                            st.session_state.pop('_jd_action_base', None)
++                            st.session_state.pop(f'core_edit_{token}', None)
++                            st.session_state['_jd_edit_flash'] = message
++                            st.session_state['_jd_saved_card_id'] = jd['id']
++                            st.rerun()
++                        st.error(message)
+ 
+ 
+ def render_admin_settings():
+@@ -55,7 +137,7 @@
+ 
+     users_tab, backups_tab = st.tabs(['المستخدمون والصلاحيات', 'النسخ الاحتياطي'])
+     with users_tab:
+-        roles = {'employee': 'موظف', 'manager': 'مدير إدارة', 'admin': 'مسؤول النظام'}
++        roles = ROLE_LABELS
+         st.markdown('#### إضافة مستخدم جديد')
+         st.caption('كلمة المرور من 12 إلى 1024 حرفاً. الحساب الجديد لا يحصل على بطاقة مخصصة تلقائياً.')
+         with st.form('admin_create_user', clear_on_submit=True):
+@@ -210,7 +292,7 @@
+     </div>
+     <div style="text-align: left; flex-shrink: 0; max-width: 100%; box-sizing: border-box;">
+         <span class="status-badge {'badge-approved' if is_admin else 'badge-pending'}" style="font-size: 0.9rem; padding: 6px 16px;">
+-            {'👑 إدارة الموارد البشرية / مسؤول النظام' if is_admin else ('👔 مدير إدارة' if is_manager else '👷 موظف')}
++            {ROLE_LABELS[user['role']]}
+         </span>
+     </div>
+ </div>
+@@ -219,11 +301,12 @@
+ # -------------------------------------------------------------
+ # ADMIN / HR MANAGER (ROLE B) INTERFACE
+ # -------------------------------------------------------------
+-if is_admin:
+-    if st.session_state.get('primary_navigation') not in ADMIN_PAGES.values():
++if user['role'] in JD_EDIT_ROLES:
++    available_pages = ADMIN_PAGES if is_admin else {'directory': ADMIN_PAGES['directory']}
++    if st.session_state.get('primary_navigation') not in available_pages.values():
+         st.session_state.pop('primary_navigation', None)
+-    selected_page = st.sidebar.radio('التنقل الرئيسي', list(ADMIN_PAGES.values()), key='primary_navigation')
+-    page = next(key for key, label in ADMIN_PAGES.items() if label == selected_page)
++    selected_page = st.sidebar.radio('التنقل الرئيسي', list(available_pages.values()), key='primary_navigation')
++    page = next(key for key, label in available_pages.items() if label == selected_page)
+ 
+     if page == 'settings':
+         render_admin_settings()
+@@ -442,15 +525,21 @@
+     if page == 'directory':
+         st.subheader("📁 الدليل الشامل لبطاقات الوصف الوظيفي")
+         all_jds = database.get_all_jds()
++        saved_card_id = st.session_state.pop('_jd_saved_card_id', None)
++        if saved_card_id is not None:
++            st.session_state['directory_jd_id'] = saved_card_id
++            st.session_state['directory_search'] = ''
++            st.session_state['directory_department'] = 'كافة الإدارات'
++            st.session_state['directory_status'] = 'كافة الحالات'
+ 
+         fcol1, fcol2, fcol3 = st.columns([3, 2, 2])
+-        search_kw = fcol1.text_input("🔍 البحث باسم الوظيفة أو الكلمات المفتاحية", placeholder="مثال: مشروعات، مبيعات، جودة، مخازن...")
++        search_kw = fcol1.text_input("🔍 البحث باسم الوظيفة أو الكلمات المفتاحية", placeholder="مثال: مشروعات، مبيعات، جودة، مخازن...", key='directory_search')
+         
+         dept_list = ["كافة الإدارات"] + sorted(list({j['department'] for j in all_jds if j['department']}))
+-        selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list)
++        selected_dept = fcol2.selectbox("تصفية حسب الإدارة", dept_list, key='directory_department')
+         
+         status_list = ["كافة الحالات", *(status.value for status in CardStatus)]
+-        selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list)
++        selected_status = fcol3.selectbox("تصفية حسب حالة الاعتماد", status_list, key='directory_status')
+ 
+         filtered_jds = all_jds
+         if search_kw:
+@@ -462,13 +551,17 @@
+ 
+         st.caption(f"يتم عرض **{len(filtered_jds)}** من أصل **{len(all_jds)}** بطاقة وصف وظيفي")
+ 
+-        jd_options = {f"{j['title']} ({j['department'] or 'الإدارة العامة'})": j['id'] for j in filtered_jds}
++        jd_options = {j['id']: f"#{j['id']} — {j['title']} ({j['department'] or 'الإدارة العامة'})" for j in filtered_jds}
+         
+         if jd_options:
+-            selected_jd_label = st.selectbox("اختر بطاقة الوصف الوظيفي لعرض كافة تفاصيلها:", list(jd_options.keys()))
+-            chosen_jd_id = jd_options[selected_jd_label]
++            if st.session_state.get('directory_jd_id') not in jd_options:
++                st.session_state.pop('directory_jd_id', None)
++            chosen_jd_id = st.selectbox("اختر بطاقة الوصف الوظيفي لعرض كافة تفاصيلها:", list(jd_options),
++                                        format_func=jd_options.get, key='directory_jd_id')
+             jd = database.get_jd_by_id(chosen_jd_id)
+             accountabilities = database.get_accountabilities(chosen_jd_id)
++
++            render_jd_edit_actions(jd, user)
+ 
+             st.markdown("---")
+             head_col1, head_col2 = st.columns([3, 1])
+@@ -514,7 +607,7 @@
+             st.markdown(f"""
+             <div class="jd-section-card">
+                 <div class="jd-section-title">٣. الهدف العام من الوظيفة</div>
+-                <div>{jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.'}</div>
++                <div style="white-space: pre-line;">{escape(jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.')}</div>
+             </div>
+             """, unsafe_allow_html=True)
+ 
+@@ -547,7 +640,7 @@
+                 st.markdown(f"""
+                 <div class="jd-section-card">
+                     <div class="jd-section-title">٦. المؤهلات والخبرات والمهارات المطلوبة</div>
+-                    <div style="white-space: pre-line;">{jd['qualifications']}</div>
++                    <div style="white-space: pre-line;">{escape(jd['qualifications'])}</div>
+                 </div>
+                 """, unsafe_allow_html=True)
+ 
+@@ -824,7 +917,7 @@
+         st.markdown(f"""
+         <div class="jd-section-card">
+             <div class="jd-section-title">٣. الهدف العام من الوظيفة</div>
+-            <div>{jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.'}</div>
++            <div style="white-space: pre-line;">{escape(jd['purpose'] or 'لم يتم إدراج بيان الهدف العام بعد.')}</div>
+         </div>
+         """, unsafe_allow_html=True)
+ 
+@@ -854,7 +947,7 @@
+             st.markdown(f"""
+             <div class="jd-section-card">
+                 <div class="jd-section-title">٦. المؤهلات العلمية والخبرات والمهارات المطلوبة</div>
+-                <div style="white-space: pre-line;">{jd['qualifications']}</div>
++                <div style="white-space: pre-line;">{escape(jd['qualifications'])}</div>
+             </div>
+             """, unsafe_allow_html=True)
+ 
+diff --git a/governance.py b/governance.py
+--- a/governance.py
++++ b/governance.py
+@@ -70,12 +70,20 @@
+                 new_review_columns |= table == 'job_descriptions' and name == 'review_hash'
+ 
+     def trigger(name, timing, body):
+-        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {name} {timing} BEGIN {body} END')
++        sql = f'CREATE TRIGGER {name} {timing} BEGIN {body} END'
++        existing = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
++        if existing and existing[0] == sql:
++            return
++        if existing:
++            conn.execute(f'DROP TRIGGER {name}')
++        conn.execute(sql)
+ 
+     dirty = ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in CONTENT_FIELDS)
+     trigger('stage2_card_revision',
+             f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions WHEN {dirty}',
+-            "UPDATE job_descriptions SET version=OLD.version+1,status='قيد المراجعة',"
++            "UPDATE job_descriptions SET version=OLD.version+1,status=CASE "
++            "WHEN OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة' AND NEW.version=OLD.version+1 "
++            "THEN 'مسودة' ELSE 'قيد المراجعة' END,"
+             "review_version=NULL,review_hash=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=NEW.id;")
+     trigger('stage2_version_guard', 'BEFORE UPDATE OF version ON job_descriptions WHEN NEW.version < OLD.version',
+             "SELECT RAISE(ABORT,'Revision cannot decrease');")
+@@ -96,7 +104,9 @@
+     valid = (f"({old}={new}) OR ({old}='مسودة' AND {new}='قيد المراجعة') OR "
+              f"({old}='قيد المراجعة' AND {new} IN ('معتمد','مرفوض')) OR "
+              f"({old}='مرفوض' AND {new}='قيد المراجعة') OR "
+-             f"({old}='معتمد' AND {new}='قيد المراجعة' AND NEW.version>OLD.version)")
++             f"({old}='معتمد' AND {new}='قيد المراجعة' AND NEW.version>OLD.version) OR "
++             f"({old}='معتمد' AND {new}='مسودة' AND NEW.version=OLD.version+1 "
++             "AND NEW.review_version IS NULL AND NEW.review_hash IS NULL)")
+     trigger('stage2_status_guard', f'BEFORE UPDATE OF status ON job_descriptions WHEN ({new}) IS NULL OR NOT ({valid})',
+             "SELECT RAISE(ABORT,'Invalid document state transition');")
+     for operation in ('UPDATE', 'DELETE'):
+diff --git a/presentation.py b/presentation.py
+--- a/presentation.py
++++ b/presentation.py
+@@ -4,6 +4,7 @@
+ 
+ import pandas as pd
+ import streamlit as st
++from roles import ROLE_LABELS
+ 
+ ADMIN_PAGES = {
+     'dashboard': '📊 لوحة المؤشرات والمتابعة',
+@@ -20,11 +21,11 @@
+     'directory': ADMIN_PAGES['directory'],
+     'export': '📥 تحميل وطباعة البطاقة',
+ }
+-ROLE_LABELS = {'admin': 'مسؤول النظام', 'manager': 'مدير إدارة', 'employee': 'موظف'}
+ COLUMN_LABELS = {'id': 'المعرف', 'title': 'المسمى الوظيفي', 'department': 'الإدارة',
+                  'reports_to': 'المسؤول المباشر', 'status': 'الحالة', 'version': 'الإصدار',
+                  'created_at': 'تاريخ الإنشاء', 'updated_at': 'تاريخ التحديث'}
+ ACTION_LABELS = {
++    'revoke approval': 'إلغاء الاعتماد وإعادة البطاقة للمسودة',
+     'update': 'تعديل بيانات', 'direct update': 'تعديل بيانات',
+     'approve': 'اعتماد نهائي', 'approved': 'اعتماد نهائي', 'approved as is': 'اعتماد نهائي دون تعديل',
+     'accept': 'قبول تعديل', 'accepted': 'قبول تعديل', 'modification accepted': 'قبول تعديل',
+diff --git a/scripts/migrate_to_supabase.py b/scripts/migrate_to_supabase.py
+--- a/scripts/migrate_to_supabase.py
++++ b/scripts/migrate_to_supabase.py
+@@ -36,7 +36,7 @@
+     username TEXT UNIQUE NOT NULL,
+     password TEXT NOT NULL,
+     full_name TEXT NOT NULL,
+-    role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'employee')),
++    role TEXT NOT NULL CHECK(role IN ('admin', 'hr', 'editor', 'manager', 'employee')),
+     department TEXT,
+     assigned_jd_id INTEGER,
+     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+@@ -217,6 +217,9 @@
+             """
+             pg_cur.execute(seq_sync_sql)
+ 
++        from scripts.migrate_hr_workflow import install_postgres_guards
++        install_postgres_guards(pg_conn)
++
+         # Commit all table data
+         pg_conn.commit()
+         print("[+] All data migrated and committed successfully.")
+diff --git a/roles.py b/roles.py
+new file mode 100644
+--- /dev/null
++++ b/roles.py
+@@ -0,0 +1,5 @@
++"""Explicit account roles; JD editing does not grant system administration."""
++JD_EDIT_ROLES = frozenset({'admin', 'hr', 'editor'})
++USER_ROLES = JD_EDIT_ROLES | {'manager', 'employee'}
++ROLE_LABELS = {'employee': 'موظف', 'manager': 'مدير إدارة', 'hr': 'موارد بشرية',
++               'editor': 'محرر بطاقات الموارد البشرية', 'admin': 'مسؤول النظام'}
+diff --git a/scripts/migrate_hr_workflow.py b/scripts/migrate_hr_workflow.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/migrate_hr_workflow.py
+@@ -0,0 +1,90 @@
++"""Install HR workflow guards without changing any business rows.
++
++SQLite: uses the existing verified-backup integrity migrator.
++PostgreSQL: applies transactional DDL to the operator-selected DATABASE_URL.
++Run with: python -B -m scripts.migrate_hr_workflow --postgres
++"""
++import argparse
++from contextlib import closing
++
++import governance
++
++
++def install_postgres_guards(conn):
++    """Supports the schema shipped by migrate_to_supabase; caller owns the transaction."""
++    old = 'CASE OLD.status ' + ' '.join(
++        f"WHEN '{alias}' THEN '{status}'" for alias, status in governance.STATUS_ALIASES.items()) + ' END'
++    new = old.replace('OLD.', 'NEW.')
++    dirty = ' OR '.join(f'NEW.{field} IS DISTINCT FROM OLD.{field}' for field in governance.CONTENT_FIELDS)
++    with conn.cursor() as cur:
++        cur.execute(f'''
++            CREATE SCHEMA IF NOT EXISTS jd_governance;
++            REVOKE ALL ON SCHEMA jd_governance FROM PUBLIC;
++            ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_role_check;
++            ALTER TABLE public.users ADD CONSTRAINT users_role_check
++                CHECK (role IN ('admin','hr','editor','manager','employee'));
++
++            CREATE OR REPLACE FUNCTION jd_governance.guard_card_revision()
++            RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = '' AS $body$
++            BEGIN
++                IF NEW.version < OLD.version THEN
++                    RAISE EXCEPTION 'Revision cannot decrease' USING ERRCODE = '23514';
++                END IF;
++                IF {dirty} THEN
++                    IF NOT (OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة'
++                            AND NEW.version=OLD.version+1) THEN
++                        NEW.status := 'قيد المراجعة';
++                    END IF;
++                    NEW.version := OLD.version+1;
++                    NEW.review_version := NULL;
++                    NEW.review_hash := NULL;
++                    NEW.updated_at := CURRENT_TIMESTAMP;
++                END IF;
++                IF ({new}) IS NULL OR NOT (
++                    ({old})=({new}) OR
++                    (({old}) IN ('مسودة','مرفوض') AND ({new})='قيد المراجعة') OR
++                    (({old})='قيد المراجعة' AND ({new}) IN ('معتمد','مرفوض')) OR
++                    (({old})='معتمد' AND ({new})='قيد المراجعة' AND NEW.version>OLD.version) OR
++                    (({old})='معتمد' AND ({new})='مسودة' AND NEW.version=OLD.version+1
++                        AND NEW.review_version IS NULL AND NEW.review_hash IS NULL)
++                ) THEN
++                    RAISE EXCEPTION 'Invalid document state transition' USING ERRCODE = '23514';
++                END IF;
++                RETURN NEW;
++            END $body$;
++            REVOKE ALL ON FUNCTION jd_governance.guard_card_revision() FROM PUBLIC;
++            DROP TRIGGER IF EXISTS hr_card_revision ON public.job_descriptions;
++            CREATE TRIGGER hr_card_revision BEFORE UPDATE ON public.job_descriptions
++                FOR EACH ROW EXECUTE FUNCTION jd_governance.guard_card_revision();
++
++            CREATE OR REPLACE FUNCTION jd_governance.guard_audit_evidence()
++            RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = '' AS $body$
++            BEGIN
++                RAISE EXCEPTION 'Audit evidence is immutable' USING ERRCODE = '23514';
++            END $body$;
++            REVOKE ALL ON FUNCTION jd_governance.guard_audit_evidence() FROM PUBLIC;
++            DROP TRIGGER IF EXISTS hr_audit_immutable ON public.jd_audit_trail;
++            CREATE TRIGGER hr_audit_immutable BEFORE UPDATE OR DELETE ON public.jd_audit_trail
++                FOR EACH ROW EXECUTE FUNCTION jd_governance.guard_audit_evidence();
++        ''')
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--postgres', action='store_true', help='Use DATABASE_URL; no SQLite fallback.')
++    args = parser.parse_args()
++    if args.postgres:
++        import database
++        if not database.HAS_PSYCOPG2 or not database.get_database_url():
++            parser.error('PostgreSQL driver and DATABASE_URL are required.')
++        with closing(database.psycopg2.connect(database.get_database_url(), connect_timeout=15)) as conn, conn:
++            install_postgres_guards(conn)
++        print('PostgreSQL HR workflow guards installed; business rows unchanged.')
++    else:
++        from scripts.migrate_integrity import migrate_integrity
++        counts, backup = migrate_integrity()
++        print(f'SQLite HR workflow guards installed. Verified backup: {backup}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/test_revoke_and_edit_jd.py b/tests/test_revoke_and_edit_jd.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_revoke_and_edit_jd.py
+@@ -0,0 +1,381 @@
++"""HR reopening/editing regressions; only disposable synthetic databases are used.
++
++Set JD_HR_TEST_PG_PORT to also run the backend cases on a dedicated local database
++named jd_hr_synthetic (never DATABASE_URL). No business database is used by tests.
++"""
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing
++import json
++import os
++from pathlib import Path
++import sqlite3
++
++import pytest
++
++import auth
++import database
++import governance
++from presentation import ADMIN_PAGES, arabic_action
++from statuses import CardStatus
++
++
++@pytest.fixture
++def workflow_db(db, session, monkeypatch):
++    port = os.environ.get('JD_HR_TEST_PG_PORT')
++    if not port:
++        return db
++    import psycopg2
++    from scripts.migrate_to_supabase import SCHEMA_SQL, TABLE_ORDER
++    from scripts.migrate_hr_workflow import install_postgres_guards
++    # Explicit isolated local target, independently of any production credentials.
++    def connect():
++        return psycopg2.connect(host='127.0.0.1', port=int(port), user='jd_hr_test',
++                                dbname='jd_hr_synthetic', connect_timeout=5)
++    with closing(connect()) as conn, conn:
++        with conn.cursor() as cur:
++            cur.execute(SCHEMA_SQL)
++            cur.execute('TRUNCATE ' + ','.join(TABLE_ORDER) + ' RESTART IDENTITY CASCADE')
++            with closing(sqlite3.connect(db)) as src:
++                for table in TABLE_ORDER:
++                    cols = [r[1] for r in src.execute(f'PRAGMA table_info({table})')]
++                    for row in src.execute(f'SELECT * FROM {table}'):
++                        cur.execute(f'INSERT INTO {table} ({",".join(cols)}) VALUES ({",".join(["%s"] * len(cols))})', row)
++                    cur.execute(f"SELECT setval(pg_get_serial_sequence('{table}','id'),"
++                                f"COALESCE((SELECT max(id) FROM {table}),1))")
++        install_postgres_guards(conn)
++    monkeypatch.setattr(database, 'get_connection', lambda: database.PostgresConnectionAdapter(connect()))
++    return db
++
++
++def execute(sql, params=()):
++    with closing(database.get_connection()) as conn, conn:
++        return conn.execute(sql, params).rowcount
++
++
++def rows(table):
++    with closing(database.get_connection()) as conn:
++        return [dict(r) for r in conn.execute(f'SELECT * FROM {table} ORDER BY id')]
++
++
++def approved(sign_in):
++    sign_in('hr')
++    if CardStatus.parse(database.get_jd_by_id(1)['status']) != CardStatus.APPROVED:
++        database.approve_jd_as_is(1, actor_id=1)
++    return database.get_jd_by_id(1)
++
++
++def draft(sign_in):
++    card = approved(sign_in)
++    assert database.revoke_jd_approval(1, 1, 'ignored', 'فتح المسودة', expected_version=card['version'])[0]
++    return database.get_jd_by_id(1)
++
++
++@pytest.mark.parametrize('spelling', ['Approved', CardStatus.APPROVED.value])
++def test_revoke_bumps_revision_preserves_content_and_exact_immutable_evidence(workflow_db, sign_in, spelling):
++    card = approved(sign_in)
++    execute('UPDATE job_descriptions SET status=? WHERE id=1', (spelling,))
++    reason = '  تحديث الهيكل التنظيمي\nومراجعة حدود الصلاحيات  '
++    children = rows('accountabilities')
++    previous = database.get_decision_evidence(1)
++    assert database.revoke_jd_approval(1, 1, 'اسم مزور', reason, expected_version=card['version'])[0]
++    saved = database.get_jd_by_id(1)
++    assert saved['status'] == CardStatus.DRAFT.value and saved['version'] == card['version'] + 1
++    assert saved['review_version'] is None and saved['review_hash'] is None
++    assert rows('accountabilities') == children
++    assert all(saved[f] == card[f] for f in governance.CONTENT_FIELDS)
++    assert database.get_approval_metadata(1) is None
++    record = database.get_audit_trail(1)[0]
++    assert record['action'] == 'revoke_approval' and record['notes'] == reason
++    assert record['actor_id'] == 1 and record['changed_by'] == 'مستخدم 1' and record['changed_at']
++    evidence = database.get_decision_evidence(1)
++    assert evidence[:-1] == previous
++    assert evidence[-1]['snapshot_json']['card']['status'] == spelling
++    assert evidence[-1]['result_json']['card']['status'] == CardStatus.DRAFT.value
++    for statement in ('UPDATE jd_audit_trail SET notes=notes', 'DELETE FROM jd_audit_trail'):
++        with pytest.raises((sqlite3.IntegrityError, getattr(database.psycopg2, 'IntegrityError', sqlite3.IntegrityError))):
++            execute(statement)
++
++
++@pytest.mark.parametrize('reason', ['', '  \n ', None])
++def test_revoke_requires_reason_without_writes(workflow_db, sign_in, reason):
++    approved(sign_in)
++    before = rows('job_descriptions'), rows('jd_audit_trail')
++    assert not database.revoke_jd_approval(1, 1, 'مستخدم 1', reason)[0]
++    assert before == (rows('job_descriptions'), rows('jd_audit_trail'))
++
++
++@pytest.mark.parametrize('status', ['Draft', 'مسودة', 'Pending Review', 'Under Review', 'قيد المراجعة', 'Rejected'])
++def test_revoke_rejects_every_nonapproved_state(workflow_db, sign_in, status):
++    sign_in('hr')
++    execute('INSERT INTO job_descriptions(id,title,status) VALUES(3,?,?)', ('بطاقة اختبار', status))
++    assert not database.revoke_jd_approval(3, 1, 'مستخدم 1', 'سبب')[0]
++    assert database.get_jd_by_id(3)['version'] == 1 and not database.get_audit_trail(3)
++
++
++@pytest.mark.parametrize('username,uid', [('manager', 2), ('staff', 3), ('other', 4)])
++def test_nonhr_cannot_revoke_edit_or_impersonate_admin(workflow_db, sign_in, username, uid):
++    approved(sign_in)
++    sign_in(username)
++    assert not database.revoke_jd_approval(1, uid, 'مسؤول النظام', 'سبب')[0]
++    assert not database.revoke_jd_approval(1, 1, 'مسؤول النظام', 'سبب')[0]
++    draft(sign_in)
++    sign_in(username)
++    before = rows('job_descriptions'), rows('jd_audit_trail')
++    assert not database.update_jd_core_info(1, uid, 'مسؤول النظام', {'purpose': 'غير مصرح'})[0]
++    assert not database.update_jd_core_info(1, 1, 'مسؤول النظام', {'purpose': 'غير مصرح'})[0]
++    assert before == (rows('job_descriptions'), rows('jd_audit_trail'))
++
++
++@pytest.mark.parametrize('role', ['hr', 'editor'])
++def test_hr_roles_authenticate_edit_all_cards_without_admin_privileges(workflow_db, sign_in, role):
++    draft(sign_in)
++    uid = database.create_new_user('hr_writer', 'أخصائي موارد بشرية', role, 'synthetic-secret', actor_id=1)
++    sign_in('hr_writer')
++    assert database.update_jd_core_info(1, uid, 'forged', {'job_title': 'عنوان جديد'})[0]
++    assert database.get_jd_by_id(1)['title'] == 'عنوان جديد'
++    sign_in('hr')
++    database.request_jd_review(1, actor_id=1)
++    database.approve_jd_as_is(1, actor_id=1)
++    sign_in('hr_writer')
++    assert database.revoke_jd_approval(1, uid, 'اسم مزور', 'تحديث موثق')[0]
++    assert database.get_audit_trail(1)[0]['changed_by'] == 'أخصائي موارد بشرية'
++    with pytest.raises(PermissionError):
++        database.get_all_users(actor_id=uid)
++    with pytest.raises(PermissionError):
++        database.create_new_user('escalation', 'اسم', 'admin', 'synthetic-secret', actor_id=uid)
++
++
++def test_partial_core_edit_versions_once_retains_draft_and_snapshots(workflow_db, sign_in):
++    card = draft(sign_in)
++    fields = {'job_title': 'مدير المشروعات', 'department': 'إدارة المشروعات', 'sector': 'قطاع العمليات',
++              'direct_manager': 'العضو المنتدب', 'job_purpose': 'إدارة المشروعات بكفاءة',
++              'qualifications': 'المؤهل: هندسة\nالخبرة: عشر سنوات'}
++    assert database.update_jd_core_info(1, 1, 'اسم مزور', fields, expected_version=card['version'])[0]
++    saved = database.get_jd_by_id(1)
++    assert saved['version'] == card['version'] + 1 and saved['status'] == 'مسودة'
++    for name, value in fields.items():
++        assert saved[database.CORE_INFO_ALIASES.get(name, name)] == value
++    record = database.get_decision_evidence(1)[-1]
++    assert record['actor_id'] == 1 and record['changed_by'] == 'مستخدم 1'
++    assert record['snapshot_json']['card']['purpose'] == card['purpose']
++    assert record['result_json']['card']['purpose'] == fields['job_purpose']
++    assert json.loads(record['new_text'])['qualifications'] == fields['qualifications']
++    # Unchanged, unrelated content and children survive the edit.
++    assert all(saved[f] == card[f] for f in governance.CONTENT_FIELDS if f not in database.CORE_INFO_FIELDS)
++    database.request_jd_review(1, actor_id=1)
++    database.approve_jd_as_is(1, actor_id=1)
++    assert database.get_approval_metadata(1)['version'] == saved['version']
++
++
++@pytest.mark.parametrize('fields', [{}, {'status': 'Approved'}, {'version': 50}, {'id': 2},
++                                     {'purpose': None}, {'title': ' '}, {'title': 'x', 'job_title': 'y'},
++                                     {'education': 'do not silently lose fields'}, {'purpose; DROP TABLE users': 'x'}])
++def test_invalid_edit_payload_is_atomic(workflow_db, sign_in, fields):
++    draft(sign_in)
++    before = rows('job_descriptions'), rows('jd_audit_trail')
++    assert not database.update_jd_core_info(1, 1, 'مستخدم 1', fields)[0]
++    assert before == (rows('job_descriptions'), rows('jd_audit_trail'))
++
++
++def test_noop_does_not_version_or_audit_and_explicit_empty_can_clear(workflow_db, sign_in):
++    card = draft(sign_in)
++    before = rows('jd_audit_trail')
++    assert database.update_jd_core_info(1, 1, '', {'purpose': card['purpose']})[0]
++    assert database.get_jd_by_id(1)['version'] == card['version'] and rows('jd_audit_trail') == before
++    assert database.update_jd_core_info(1, 1, '', {'purpose': ''})[0]
++    assert database.get_jd_by_id(1)['purpose'] == ''
++
++
++def test_stale_updates_and_replayed_revoke_fail_without_writes(workflow_db, sign_in):
++    original = approved(sign_in)
++    assert not database.update_jd_core_info(1, 1, '', {'purpose': 'ممنوع'})[0]
++    assert not database.revoke_jd_approval(1, 1, '', 'سبب', expected_version=original['version'] + 1)[0]
++    assert database.revoke_jd_approval(1, 1, '', 'سبب', expected_version=original['version'])[0]
++    before = rows('job_descriptions'), rows('jd_audit_trail')
++    assert not database.revoke_jd_approval(1, 1, '', 'تكرار')[0]
++    assert not database.update_jd_core_info(1, 1, '', {'purpose': 'قديم'}, expected_version=original['version'])[0]
++    assert before == (rows('job_descriptions'), rows('jd_audit_trail'))
++
++
++def test_missing_card_and_unauthenticated_actions_fail(workflow_db, sign_in, session):
++    sign_in('hr')
++    assert not database.revoke_jd_approval(999, 1, '', 'سبب')[0]
++    assert not database.update_jd_core_info(999, 1, '', {'title': 'عنوان'})[0]
++    session.clear()
++    assert not database.revoke_jd_approval(1, 1, '', 'سبب')[0]
++    assert not database.update_jd_core_info(1, 1, '', {'title': 'عنوان'})[0]
++
++
++def test_disabled_hr_account_cannot_write(workflow_db, sign_in):
++    approved(sign_in)
++    execute('UPDATE users SET is_active=0 WHERE id=1')
++    assert not database.revoke_jd_approval(1, 1, '', 'سبب')[0]
++    assert not database.update_jd_core_info(1, 1, '', {'purpose': 'تغيير'})[0]
++
++
++def test_audit_failure_rolls_back_revocation_and_edit(workflow_db, sign_in, monkeypatch):
++    approved(sign_in)
++    def fail(*args):
++        raise RuntimeError('synthetic audit failure')
++    with monkeypatch.context() as scoped:
++        scoped.setattr(database, '_audit_direct_change', fail)
++        with pytest.raises(RuntimeError):
++            database.revoke_jd_approval(1, 1, '', 'سبب')
++    assert database.get_jd_by_id(1)['status'] == 'معتمد'
++    assert database.revoke_jd_approval(1, 1, '', 'سبب')[0]
++    before = rows('job_descriptions'), rows('jd_audit_trail')
++    monkeypatch.setattr(database, '_audit_direct_change', fail)
++    with pytest.raises(RuntimeError):
++        database.update_jd_core_info(1, 1, '', {'purpose': 'تغيير'})
++    assert before == (rows('job_descriptions'), rows('jd_audit_trail'))
++
++
++def test_concurrent_revocations_only_one_wins(workflow_db, sign_in):
++    approved(sign_in)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda _: database.revoke_jd_approval(1, 1, '', 'سبب'), range(2)))
++    assert sum(ok for ok, message in results) == 1
++    assert len([r for r in rows('jd_audit_trail') if r['action'] == 'revoke_approval']) == 1
++
++
++def test_concurrent_core_edits_check_the_displayed_version(workflow_db, sign_in):
++    card = draft(sign_in)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda text: database.update_jd_core_info(
++            1, 1, '', {'purpose': text}, expected_version=card['version']), ('هدف أ', 'هدف ب')))
++    assert sum(ok for ok, message in results) == 1
++    assert database.get_jd_by_id(1)['version'] == card['version'] + 1
++
++
++def test_guard_upgrade_is_idempotent_and_preserves_rows(workflow_db):
++    before = rows('job_descriptions'), rows('accountabilities'), rows('users'), rows('jd_audit_trail')
++    for _ in range(2):
++        with closing(database.get_connection()) as conn, conn:
++            if isinstance(conn, database.PostgresConnectionAdapter):
++                from scripts.migrate_hr_workflow import install_postgres_guards
++                install_postgres_guards(conn._conn)
++            else:
++                governance.migrate(conn)
++    assert before == (rows('job_descriptions'), rows('accountabilities'), rows('users'), rows('jd_audit_trail'))
++
++
++@pytest.mark.parametrize('status', ['Under Review', 'Rejected'])
++def test_direct_edit_requires_draft(workflow_db, sign_in, status):
++    sign_in('hr')
++    execute('INSERT INTO job_descriptions(id,title,status) VALUES(3,?,?)', ('بطاقة', status))
++    assert not database.update_jd_core_info(3, 1, '', {'purpose': 'غير متاح'})[0]
++    assert database.get_jd_by_id(3)['version'] == 1
++
++
++def ui_login(db, username='hr', card_id=None):
++    from streamlit.testing.v1 import AppTest
++    from password_security import hash_password
++    with sqlite3.connect(db) as conn:
++        conn.execute('UPDATE users SET password=?', (hash_password('synthetic-secret'),))
++    app = AppTest.from_file(Path(__file__).resolve().parents[1] / 'app.py', default_timeout=10).run()
++    app.sidebar.text_input[0].input(username)
++    app.sidebar.text_input[1].input('synthetic-secret')
++    app.sidebar.button[0].click().run()
++    app.sidebar.radio[0].set_value(ADMIN_PAGES['directory']).run()
++    if card_id is not None:
++        selector = next(w for w in app.selectbox if w.label.startswith('اختر بطاقة الوصف الوظيفي لعرض'))
++        selector.set_value(card_id).run()
++    assert not app.exception and not app.error
++    return app
++
++
++def button(app, label):
++    return next(b for b in app.button if b.label == label)
++
++
++def test_ui_revoke_requires_reason_then_reopens_and_saves_arabic_metadata(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(id,title,status) VALUES(0,'بطاقة معتمدة','Approved')")
++    app = ui_login(db, card_id=0)
++    button(app, '🔄 إلغاء الاعتماد وفتح التعديل').click().run()
++    button(app, 'تأكيد إلغاء الاعتماد').click().run()
++    assert any('سبب' in error.value for error in app.error)
++    next(w for w in app.text_area if w.label == 'سبب إلغاء الاعتماد').input('مراجعة المتطلبات')
++    button(app, 'تأكيد إلغاء الاعتماد').click().run()
++    assert not app.exception and not app.error
++    assert not any(b.label == '🔄 إلغاء الاعتماد وفتح التعديل' for b in app.button)
++    button(app, '✏️ تعديل بيانات البطاقة').click().run()
++    button(app, 'حفظ بيانات البطاقة').click().run()
++    assert database.get_jd_by_id(0)['version'] == 2 and database.get_jd_by_id(0)['qualifications'] is None
++    next(w for w in app.text_input if w.label == 'المسمى الوظيفي').input('المسمى الجديد')
++    button(app, 'حفظ بيانات البطاقة').click().run()
++    assert not app.exception and not app.error
++    card = database.get_jd_by_id(0)
++    assert card['title'] == 'المسمى الجديد' and card['status'] == 'مسودة' and card['version'] == 3
++    assert card['qualifications'] is None
++    assert app.selectbox(key='directory_jd_id').value == 0
++    assert any(element.value == '### المسمى الجديد' for element in app.markdown)
++
++
++@pytest.mark.parametrize('role', ['hr', 'editor'])
++def test_ui_hr_roles_have_directory_actions_without_admin_panel(db, role):
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE users SET role=? WHERE id=2", (role,))
++        conn.execute("INSERT INTO job_descriptions(id,title,status) VALUES(0,'بطاقة مسودة','Draft')")
++    app = ui_login(db, 'manager', card_id=0)
++    assert app.sidebar.radio[0].options == [ADMIN_PAGES['directory']]
++    assert any(b.label == '✏️ تعديل بيانات البطاقة' for b in app.button)
++    assert not any(b.label == 'إضافة المستخدم' for b in app.button)
++
++
++@pytest.mark.parametrize('username', ['manager', 'staff'])
++def test_ui_members_have_no_direct_edit_or_revoke_controls(db, username):
++    app = ui_login(db, username)
++    assert not any(b.label in ('✏️ تعديل بيانات البطاقة', '🔄 إلغاء الاعتماد وفتح التعديل') for b in app.button)
++
++
++def test_revocation_action_has_readable_arabic_label():
++    assert arabic_action('revoke_approval') == 'إلغاء الاعتماد وإعادة البطاقة للمسودة'
++
++
++def test_ui_stale_edit_is_rejected_and_reload_recovers(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(id,title,status,purpose) VALUES(0,'مسودة قديمة','Draft','قديم')")
++    app = ui_login(db, card_id=0)
++    button(app, '✏️ تعديل بيانات البطاقة').click().run()
++    next(w for w in app.text_area if w.label == 'الهدف العام من الوظيفة').input('مدخل قديم')
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE job_descriptions SET purpose='أحدث',status='مسودة',version=version+1 WHERE id=0")
++    button(app, 'حفظ بيانات البطاقة').click().run()
++    assert not app.exception
++    assert any('تغير إصدار' in warning.value for warning in app.warning)
++    assert database.get_jd_by_id(0)['purpose'] == 'أحدث'
++    button(app, 'تحميل الإصدار الحالي وإغلاق النموذج القديم').click().run()
++    button(app, '✏️ تعديل بيانات البطاقة').click().run()
++    assert next(w for w in app.text_area if w.label == 'الهدف العام من الوظيفة').value == 'أحدث'
++
++
++def test_ui_cancelling_revoke_leaves_approved_card_and_audit_untouched(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(id,title,status) VALUES(0,'معتمدة','Approved')")
++    app = ui_login(db, card_id=0)
++    button(app, '🔄 إلغاء الاعتماد وفتح التعديل').click().run()
++    next(w for w in app.text_area if w.label == 'سبب إلغاء الاعتماد').input('تم إلغاء العملية')
++    button(app, 'إلغاء').click().run()
++    assert not app.exception and not database.get_audit_trail(0)
++    assert database.get_jd_by_id(0)['status'] == 'معتمد'
++
++
++def test_ui_revoke_from_filtered_directory_keeps_same_card_open(db):
++    with sqlite3.connect(db) as conn:
++        conn.execute("INSERT INTO job_descriptions(id,title,department,status) VALUES(0,'معتمدة','إدارة قديمة','Approved')")
++    app = ui_login(db, card_id=0)
++    app.selectbox(key='directory_status').set_value('معتمد').run()
++    app.selectbox(key='directory_department').set_value('إدارة قديمة').run()
++    button(app, '🔄 إلغاء الاعتماد وفتح التعديل').click().run()
++    next(w for w in app.text_area if w.label == 'سبب إلغاء الاعتماد').input('تغيير الإدارة')
++    button(app, 'تأكيد إلغاء الاعتماد').click().run()
++    assert not app.exception and not app.error
++    assert app.selectbox(key='directory_jd_id').value == 0
++    assert app.selectbox(key='directory_status').value == 'كافة الحالات'
++    button(app, '✏️ تعديل بيانات البطاقة').click().run()
++    next(w for w in app.text_input if w.label == 'الإدارة').input('إدارة جديدة')
++    button(app, 'حفظ بيانات البطاقة').click().run()
++    assert not app.exception and not app.error
++    assert app.selectbox(key='directory_jd_id').value == 0
++    assert database.get_jd_by_id(0)['department'] == 'إدارة جديدة'
+diff --git a/docs/HR_JD_EDIT_WORKFLOW.md b/docs/HR_JD_EDIT_WORKFLOW.md
+new file mode 100644
+--- /dev/null
++++ b/docs/HR_JD_EDIT_WORKFLOW.md
+@@ -0,0 +1,124 @@
++# HR direct JD editing and approval revocation
++
++Implemented on 2 November 2026. The existing SQLite/PostgreSQL adapters, Argon2id
++authentication, integer revision numbers, Arabic statuses and Word format remain in use.
++
++## Behavior
++
++- The JD directory exposes revocation to authenticated `admin`, `hr` and `editor`
++  accounts for Approved cards. Both English legacy statuses and canonical Arabic
++  values are recognized. A confirmation form requires a nonblank reason.
++- Revocation atomically sets the status to `مسودة`, advances the integer revision
++  once (for example, 1 → 2), clears review tokens and appends `revoke_approval` to
++  the existing audit `action` column. This is the schema's equivalent of the
++  requested `action_type`; no duplicate audit column is introduced.
++- The exact reason, verified actor ID/name, UTC timestamp and hash-verified before
++  and after snapshots are retained. The supplied `actor_name` argument cannot
++  override the authenticated actor. Old approval evidence is preserved, and
++  the reopened revision no longer exports current electronic approval metadata.
++- Drafts expose a form for title, department, sector, direct supervisor, purpose
++  and the existing combined qualification/experience/skills text. Partial edits
++  preserve omitted values. Explicit empty strings can clear optional fields;
++  a blank title is rejected. Changed fields are allowlisted and recorded with
++  before/after evidence. A successful edit advances the revision once and remains
++  Draft until the existing review workflow is used. No-op saves add no revision
++  or audit event and preserve untouched NULL values.
++- UI forms retain the displayed revision. Stale forms show a reload action, and
++  the APIs also accept `expected_version` to reject stale submissions under the
++  write lock. Simultaneous revocations succeed only once. SQLite uses the existing
++  `BEGIN IMMEDIATE`; PostgreSQL locks the account and card with `FOR UPDATE`.
++- The directory selector uses stable card IDs, including for duplicate titles.
++  Successful writes keep the edited card selected and reset active search/status/
++  department filters so its new title, department or Draft status stays visible.
++- `hr` and `editor` accounts can use this directory workflow across cards. They
++  cannot access user management, password resets, backups or other admin screens.
++  `manager` and `employee` retain their existing assigned-card workflows and cannot
++  call the new direct editing APIs. Roles come from fresh server-side user records.
++
++## Modified files
++
++| File | Change |
++| --- | --- |
++| `database.py` | Transactional revocation/core-edit APIs, role/state validation, revision checks, immutable snapshots and deterministic audit ordering. |
++| `app.py` | Arabic confirmation/edit forms, toast and refresh, stale-form recovery, stable card selection and safe multiline text presentation. |
++| `roles.py` | Shared role allowlists and Arabic role labels. |
++| `auth.py` | Authenticate the explicit HR/editor roles while retaining active-account/session checks. |
++| `governance.py` | Idempotently upgrade SQLite revision/status triggers; permit versioned Approved → Draft and preserve intentional Draft edits. |
++| `presentation.py` | Arabic label for `revoke_approval`, shared role labels. |
++| `scripts/migrate_hr_workflow.py` | Transactional PostgreSQL role/revision/status/audit guards and backed-up SQLite migration entry point. |
++| `scripts/migrate_to_supabase.py` | Include new roles and guards when provisioning a PostgreSQL target. |
++| `tests/test_revoke_and_edit_jd.py` | Dedicated backend and real Streamlit AppTest workflow regressions; optional isolated local PostgreSQL execution. |
++| `.gitignore` | Exclude disposable HR test databases/server artifacts and SQLite journal sidecars. |
++| `docs/HR_JD_EDIT_WORKFLOW.md` | Behavior, rollout instructions and verification evidence. |
++
++## Deployment
++
++For an existing PostgreSQL deployment, run the migration once with the existing
++server-side `DATABASE_URL` configured, then restart Streamlit:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.migrate_hr_workflow --postgres
++```
++
++The migration targets PostgreSQL explicitly and never falls back to SQLite.
++It installs invoker trigger functions in the private `jd_governance` schema,
++revokes public function access, expands the shipped `users_role_check`, and
++protects audit rows against UPDATE/DELETE. It does not create public RPCs,
++change RLS policies, or update business rows. Use a database operator account
++with DDL privileges for this migration. This work did not change a remote
++Supabase project.
++
++SQLite startup applies the updated guards after the existing verified backup.
++An operator can instead apply them before startup with:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.migrate_hr_workflow
++```
++
++There is no automatic promotion of existing accounts. An admin can create an
++explicit HR/editor account through the existing user-management form.
++
++## Verification
++
++- Pre-flight: **248 passed** before changes.
++- Final required regression command: **293 passed**, no failures or skips, in
++  **52.35 seconds**: all **248 existing + 45 new** cases. The 130 warnings are
++  upstream Streamlit/importlib metadata deprecations.
++- Dependency verification: **No broken requirements found**.
++- All HR backend cases were also executed against a disposable localhost
++  PostgreSQL 18.4 database: **37 passed**. UI cases execute against SQLite in the
++  full regression gate.
++- A read-only-source rehearsal verified migration preservation, idempotence and
++  exact restore with **26 cards, 399 responsibilities and 9 interviews**. It
++  preserved every preexisting value/ID in all tables and left the supplied
++  business database unchanged.
++- Browser QA verified the Arabic confirmation/reason form, successful revocation,
++  Draft metadata editing and version advancement. It also verified that the
++  renamed card stays selected after saving. Screenshots use synthetic data only:
++  `_stage3_work/hr-jd-edit/revoke-confirmation.png` and `draft-edit-success.png`.
++  No business records or credentials are included in the patch. Temporary QA
++  servers are stopped after verification.
++
++```powershell
++$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
++.\.venv\Scripts\python -B -m pytest -q
++.\.venv\Scripts\python -m pip check
++```
++
++The optional PostgreSQL test fixture requires a dedicated local test instance
++with a disposable database named `jd_hr_synthetic` and user `jd_hr_test`. It
++resets only that explicitly named database's synthetic tables and never reads
++`DATABASE_URL`:
++
++```powershell
++$env:JD_HR_TEST_PG_PORT = '55439'
++.\.venv\Scripts\python -B -m pytest -q tests/test_revoke_and_edit_jd.py -k 'not test_ui'
++Remove-Item Env:JD_HR_TEST_PG_PORT
++```
++
++Row-lock behavior follows the official
++[PostgreSQL locking documentation](https://www.postgresql.org/docs/current/explicit-locking.html).
++Audit triggers guard ordinary database operations; a database/schema owner can
++remove those guards, as with the existing SQLite governance model.
++
++Unified patch: `docs/changes/hr-jd-edit-workflow.patch`.

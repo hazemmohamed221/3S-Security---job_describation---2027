@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from roles import ROLE_LABELS
 
 ADMIN_PAGES = {
     'dashboard': '📊 لوحة المؤشرات والمتابعة',
@@ -20,11 +21,11 @@ MEMBER_PAGES = {
     'directory': ADMIN_PAGES['directory'],
     'export': '📥 تحميل وطباعة البطاقة',
 }
-ROLE_LABELS = {'admin': 'مسؤول النظام', 'manager': 'مدير إدارة', 'employee': 'موظف'}
 COLUMN_LABELS = {'id': 'المعرف', 'title': 'المسمى الوظيفي', 'department': 'الإدارة',
                  'reports_to': 'المسؤول المباشر', 'status': 'الحالة', 'version': 'الإصدار',
                  'created_at': 'تاريخ الإنشاء', 'updated_at': 'تاريخ التحديث'}
 ACTION_LABELS = {
+    'revoke approval': 'إلغاء الاعتماد وإعادة البطاقة للمسودة',
     'update': 'تعديل بيانات', 'direct update': 'تعديل بيانات',
     'approve': 'اعتماد نهائي', 'approved': 'اعتماد نهائي', 'approved as is': 'اعتماد نهائي دون تعديل',
     'accept': 'قبول تعديل', 'accepted': 'قبول تعديل', 'modification accepted': 'قبول تعديل',

@@ -9,6 +9,7 @@ import hashlib
 import html
 import time
 from password_security import hash_password, verify_password
+from roles import USER_ROLES, JD_EDIT_ROLES, ROLE_LABELS
 
 IDLE_SECONDS = 30 * 60
 MAX_SESSION_SECONDS = 12 * 60 * 60
@@ -40,7 +41,7 @@ def get_authenticated_user():
         _clear_session()
         return None
     user = database.get_user_by_id(principal_id)
-    if (not user or not user.get('is_active', 1) or user['role'] not in ('admin', 'manager', 'employee')
+    if (not user or not user.get('is_active', 1) or user['role'] not in USER_ROLES
             or state.get('_auth_credential') != _credential_fingerprint(user)):
         _clear_session()
         return None
@@ -50,7 +51,8 @@ def get_authenticated_user():
     state.user_info = public
     state['user'] = public
     state.role = public['role']
-    state.permissions = ('review', 'import', 'schedule', 'all_cards') if public['role'] == 'admin' else ('assigned_card',)
+    state.permissions = (('review', 'import', 'schedule', 'all_cards') if public['role'] == 'admin'
+                         else ('edit_jd', 'all_cards') if public['role'] in JD_EDIT_ROLES else ('assigned_card',))
     state['_auth_last_seen'] = now
     return public
 
@@ -74,7 +76,7 @@ def login(username, password):
     user = database.get_user_by_username(username)
     valid = user and verify_password(user['password'], password)
     _clear_session()
-    if valid and user.get('is_active', 1) and user['role'] in ('admin', 'manager', 'employee'):
+    if valid and user.get('is_active', 1) and user['role'] in USER_ROLES:
         st.session_state['_auth_user_id'] = user['id']
         st.session_state['_auth_credential'] = _credential_fingerprint(user)
         st.session_state['_auth_issued_at'] = time.time()
@@ -126,7 +128,7 @@ def render_auth_sidebar():
         """)
     else:
         user = get_authenticated_user()
-        role_label = "إدارة الموارد البشرية / مسؤول النظام" if user['role'] == 'admin' else ("مدير إدارة" if user['role'] == 'manager' else "موظف")
+        role_label = ROLE_LABELS[user['role']]
         badge_class = "badge-approved" if user['role'] == 'admin' else "badge-pending"
 
         st.sidebar.markdown(f"""

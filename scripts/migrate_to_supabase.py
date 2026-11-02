@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
     full_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'employee')),
+    role TEXT NOT NULL CHECK(role IN ('admin', 'hr', 'editor', 'manager', 'employee')),
     department TEXT,
     assigned_jd_id INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -216,6 +216,9 @@ def migrate(sqlite_path=None, database_url=None):
                 );
             """
             pg_cur.execute(seq_sync_sql)
+
+        from scripts.migrate_hr_workflow import install_postgres_guards
+        install_postgres_guards(pg_conn)
 
         # Commit all table data
         pg_conn.commit()
