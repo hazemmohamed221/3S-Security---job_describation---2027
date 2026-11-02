@@ -144,6 +144,11 @@ CREATE INDEX IF NOT EXISTS idx_mod_requests_jd ON modification_requests(jd_id, s
 CREATE INDEX IF NOT EXISTS idx_audit_trail_jd ON jd_audit_trail(jd_id, changed_at);
 """
 
+from jd_fields import DETAIL_FIELDS
+SCHEMA_SQL += '\n'.join(
+    f'ALTER TABLE public.job_descriptions ADD COLUMN IF NOT EXISTS {name} TEXT;'
+    for name in (*DETAIL_FIELDS, 'edit_batch_token'))
+
 TABLE_ORDER = [
     "users",
     "job_descriptions",

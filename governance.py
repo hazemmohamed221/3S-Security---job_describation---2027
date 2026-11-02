@@ -2,12 +2,14 @@
 import hashlib
 import json
 from statuses import CardStatus, ALIASES, install_constraints
+from jd_fields import DETAIL_FIELDS
 
 CONTENT_FIELDS = (
     'job_code', 'title', 'department', 'sector', 'reports_to', 'purpose',
     'dimensions', 'frameworks', 'qualifications', 'competencies', 'hazards',
     'safe_practices', 'internal_relations', 'external_relations', 'approvals',
     'source_file',
+    *DETAIL_FIELDS,
 )
 STATUS_ALIASES = {key: status.value for key, status in ALIASES[CardStatus].items()}
 
@@ -34,7 +36,9 @@ def snapshot(conn, jd_id):
 
 
 def content_hash(state):
-    card = {k: v for k, v in state['card'].items() if k not in ('status', 'version')}
+    # Empty additive fields must not invalidate historical approvals/review hashes.
+    card = {k: v for k, v in state['card'].items() if k not in ('status', 'version')
+            and not (k in DETAIL_FIELDS and v in (None, ''))}
     return digest(encode({'card': card, 'accountabilities': state['accountabilities']}))
 
 
@@ -51,7 +55,8 @@ def migrate(conn):
     have no provable base revision and must be rejected/resubmitted to be accepted.
     """
     additions = {
-        'job_descriptions': {'review_version': 'INTEGER', 'review_hash': 'TEXT', 'import_hash': 'TEXT'},
+        'job_descriptions': {'review_version': 'INTEGER', 'review_hash': 'TEXT', 'import_hash': 'TEXT',
+                             **{name: 'TEXT' for name in DETAIL_FIELDS}, 'edit_batch_token': 'TEXT'},
         'modification_requests': {
             'expected_version': 'INTEGER', 'expected_hash': 'TEXT', 'requested_snapshot': 'TEXT',
         },
@@ -80,7 +85,8 @@ def migrate(conn):
 
     dirty = ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in CONTENT_FIELDS)
     trigger('stage2_card_revision',
-            f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions WHEN {dirty}',
+            f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions '
+            f'WHEN NEW.edit_batch_token IS NULL AND ({dirty})',
             "UPDATE job_descriptions SET version=OLD.version+1,status=CASE "
             "WHEN OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة' AND NEW.version=OLD.version+1 "
             "THEN 'مسودة' ELSE 'قيد المراجعة' END,"
@@ -92,6 +98,8 @@ def migrate(conn):
         ('UPDATE', 'NEW', ' WHEN ' + ' OR '.join(
             f'NEW.{f} IS NOT OLD.{f}' for f in ('description', 'kpi', 'item_order', 'is_active'))),
     ):
+        batching = f'(SELECT edit_batch_token FROM job_descriptions WHERE id={ref}.jd_id) IS NULL'
+        condition = f' WHEN {batching}' + (f' AND ({condition.removeprefix(" WHEN ")})' if condition else '')
         trigger(f'stage2_child_{event.lower()}', f'AFTER {event} ON accountabilities{condition}',
                 "UPDATE job_descriptions SET version=version+1,status='قيد المراجعة',review_version=NULL,review_hash=NULL,"
                 f"updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id={ref}.jd_id;")

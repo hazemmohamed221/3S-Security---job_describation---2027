@@ -17,6 +17,8 @@ import governance
 from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
 from upload_security import sanitize_docx_filename
 from roles import USER_ROLES, JD_EDIT_ROLES
+from jd_fields import DETAIL_FIELDS, EDIT_FIELDS, FIELD_ALIASES
+from uuid import uuid4
 
 try:
     from dotenv import load_dotenv
@@ -480,6 +482,14 @@ def _insert_parsed_jd(conn, parsed, source_file, changed_by="مسؤول النظ
     ))
     jd_id = cur.lastrowid
 
+    extra = {field: parsed[field] for field in DETAIL_FIELDS if field in parsed}
+    if extra:
+        # This is part of initial import, before any review is bound.
+        cur.execute('UPDATE job_descriptions SET edit_batch_token=? WHERE id=?', (uuid4().hex, jd_id))
+        cur.execute('UPDATE job_descriptions SET ' + ','.join(f'{f}=?' for f in extra) + ' WHERE id=?',
+                    (*extra.values(), jd_id))
+        cur.execute('UPDATE job_descriptions SET edit_batch_token=NULL WHERE id=?', (jd_id,))
+
     for idx, acc in enumerate(parsed.get('accountabilities', [])):
         cur.execute("""
         INSERT INTO accountabilities (jd_id, item_order, description, kpi, version, is_active)
@@ -674,7 +684,8 @@ def create_or_update_jd(parsed_jd, source_file, *, actor_id):
         actor = _require_actor(conn, actor_id, admin=True)
         if parsed_jd.get('format_version') == 2:
             import_hash = governance.digest(governance.encode({
-                'fields': {f: parsed_jd.get(f) or '' for f in governance.CONTENT_FIELDS if f != 'source_file'},
+                'fields': {f: parsed_jd.get(f) or '' for f in governance.CONTENT_FIELDS if f != 'source_file'
+                           and not (f in DETAIL_FIELDS and not parsed_jd.get(f))},
                 'accountabilities': parsed_jd.get('accountabilities', []),
             }))
             existing = conn.execute('SELECT * FROM job_descriptions WHERE id=?',
@@ -912,6 +923,98 @@ def update_jd_core_info(card_id: int, actor_id: int, actor_name: str, fields: di
     except (PermissionError, ValueError) as exc:
         return False, str(exc)
     return True, 'تم تحديث بيانات البطاقة وتسجيل التعديلات بنجاح.'
+
+
+def update_jd_full_details(card_id: int, actor_id: int, actor_name: str, core_fields: dict,
+                           responsibilities: list[dict], *, expected_version=None) -> tuple[bool, str]:
+    """Save one complete editable revision, archiving removed responsibilities.
+
+    core_fields is partial; responsibilities is the complete desired active list.
+    IDs identify existing active rows on this card only. New rows omit id.
+    """
+    try:
+        with _write_connection() as conn:
+            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
+            status = CardStatus.parse(card['status'])
+            if status not in (CardStatus.DRAFT, CardStatus.PENDING_REVIEW):
+                raise ValueError('التعديل الشامل متاح للمسودة أو البطاقة قيد المراجعة. يجب إلغاء الاعتماد أولاً.')
+            if not isinstance(core_fields, dict) or not isinstance(responsibilities, list):
+                raise ValueError('بيانات البطاقة وقائمة المسؤوليات غير صالحة.')
+            fields = {}
+            for key, value in core_fields.items():
+                name = FIELD_ALIASES.get(key, key)
+                if name not in EDIT_FIELDS or name in fields or not isinstance(value, str):
+                    raise ValueError('تتضمن البيانات حقلاً غير مسموح أو قيمة غير صالحة.')
+                if name == 'title' and not value.strip():
+                    raise ValueError('المسمى الوظيفي مطلوب.')
+                fields[name] = value
+            lock = ' FOR UPDATE' if isinstance(conn, PostgresConnectionAdapter) else ''
+            current = [dict(row) for row in conn.execute(
+                'SELECT * FROM accountabilities WHERE jd_id=? AND is_active=1 ORDER BY item_order,id' + lock,
+                (card_id,))]
+            by_id = {row['id']: row for row in current}
+            normalized, seen_ids, seen_orders = [], set(), set()
+            for index, item in enumerate(responsibilities, 1):
+                if not isinstance(item, dict) or set(item) - {'id', 'description', 'kpi', 'item_order'}:
+                    raise ValueError('بيانات المسؤولية غير صالحة.')
+                uid = item.get('id')
+                if uid is not None and (type(uid) is not int or uid not in by_id or uid in seen_ids):
+                    raise ValueError('معرف مسؤولية مكرر أو غير نشط أو لا يتبع هذه البطاقة.')
+                if uid is not None:
+                    seen_ids.add(uid)
+                previous = by_id.get(uid, {})
+                description = item.get('description')
+                kpi = item.get('kpi', previous.get('kpi'))
+                order = item.get('item_order', previous.get('item_order', index))
+                if not isinstance(description, str) or not description.strip():
+                    raise ValueError('نص كل مسؤولية مطلوب. احذف البند الفارغ أو أدخل نصه.')
+                if kpi is not None and not isinstance(kpi, str):
+                    raise ValueError('مؤشر قياس الأداء غير صالح.')
+                if type(order) is not int or order < 1 or order in seen_orders:
+                    raise ValueError('ترتيب المسؤوليات يجب أن يكون أرقاماً موجبة غير مكررة.')
+                seen_orders.add(order)
+                normalized.append({'id': uid, 'description': description, 'kpi': kpi, 'item_order': order})
+            changed_fields = {name: value for name, value in fields.items() if value != card[name]}
+            removed = sorted(set(by_id) - seen_ids)
+            updated = [row for row in normalized if row['id'] is not None and any(
+                row[name] != by_id[row['id']][name] for name in ('description', 'kpi', 'item_order'))]
+            added = [row for row in normalized if row['id'] is None]
+            if not (changed_fields or removed or updated or added):
+                return True, 'لا توجد تغييرات للحفظ.'
+            before = governance.snapshot(conn, card_id)
+            # The marker is visible only within this locked transaction. Ordinary
+            # writes retain the existing per-mutation revision triggers.
+            conn.execute('UPDATE job_descriptions SET edit_batch_token=? WHERE id=?', (uuid4().hex, card_id))
+            if changed_fields:
+                conn.execute('UPDATE job_descriptions SET ' + ','.join(f'{name}=?' for name in changed_fields)
+                             + ' WHERE id=?', (*changed_fields.values(), card_id))
+            for uid in removed:
+                conn.execute('UPDATE accountabilities SET is_active=0,version=version+1 WHERE id=? AND jd_id=?',
+                             (uid, card_id))
+            for row in updated:
+                conn.execute('''UPDATE accountabilities SET description=?,kpi=?,item_order=?,version=version+1
+                    WHERE id=? AND jd_id=? AND is_active=1''',
+                    (row['description'], row['kpi'], row['item_order'], row['id'], card_id))
+            new_ids = []
+            for row in added:
+                cursor = conn.execute('''INSERT INTO accountabilities(jd_id,item_order,description,kpi)
+                    VALUES (?,?,?,?)''', (card_id, row['item_order'], row['description'], row['kpi']))
+                new_ids.append(cursor.lastrowid)
+            conn.execute('''UPDATE job_descriptions SET version=version+1,status=?,edit_batch_token=NULL,
+                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
+                (status.value, _utc_now(), card_id))
+            notes = governance.encode({
+                'الحقول المعدلة': {name: EDIT_FIELDS[name] for name in changed_fields},
+                'المسؤوليات': {'معدلة': [row['id'] for row in updated], 'مضافة': new_ids, 'محذوفة من العرض': removed},
+            })
+            after = governance.snapshot(conn, card_id)
+            _audit_direct_change(conn, card_id, actor, 'full_update', 'تعديل شامل لبطاقة الوصف الوظيفي',
+                governance.encode({'fields': {name: card[name] for name in changed_fields}, 'responsibilities': current}),
+                governance.encode({'fields': changed_fields, 'responsibilities': [
+                    row for row in after['accountabilities'] if row['is_active']]}), notes, before)
+    except (PermissionError, ValueError) as exc:
+        return False, str(exc)
+    return True, 'تم حفظ التعديل الشامل وتوثيق الإصدار الجديد. يلزم إرسال الإصدار المعدل للمراجعة قبل الاعتماد.'
 
 
 def request_jd_review(jd_id, *, actor_id):

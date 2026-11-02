@@ -8,6 +8,7 @@ import argparse
 from contextlib import closing
 
 import governance
+from jd_fields import DETAIL_FIELDS
 
 
 def install_postgres_guards(conn):
@@ -17,6 +18,8 @@ def install_postgres_guards(conn):
     new = old.replace('OLD.', 'NEW.')
     dirty = ' OR '.join(f'NEW.{field} IS DISTINCT FROM OLD.{field}' for field in governance.CONTENT_FIELDS)
     with conn.cursor() as cur:
+        for name in (*DETAIL_FIELDS, 'edit_batch_token'):
+            cur.execute(f'ALTER TABLE public.job_descriptions ADD COLUMN IF NOT EXISTS {name} TEXT')
         cur.execute(f'''
             CREATE SCHEMA IF NOT EXISTS jd_governance;
             REVOKE ALL ON SCHEMA jd_governance FROM PUBLIC;
@@ -30,7 +33,7 @@ def install_postgres_guards(conn):
                 IF NEW.version < OLD.version THEN
                     RAISE EXCEPTION 'Revision cannot decrease' USING ERRCODE = '23514';
                 END IF;
-                IF {dirty} THEN
+                IF NEW.edit_batch_token IS NULL AND ({dirty}) THEN
                     IF NOT (OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة'
                             AND NEW.version=OLD.version+1) THEN
                         NEW.status := 'قيد المراجعة';
@@ -66,6 +69,27 @@ def install_postgres_guards(conn):
             DROP TRIGGER IF EXISTS hr_audit_immutable ON public.jd_audit_trail;
             CREATE TRIGGER hr_audit_immutable BEFORE UPDATE OR DELETE ON public.jd_audit_trail
                 FOR EACH ROW EXECUTE FUNCTION jd_governance.guard_audit_evidence();
+
+            CREATE OR REPLACE FUNCTION jd_governance.advance_parent_revision()
+            RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = '' AS $body$
+            DECLARE parent_id integer;
+            BEGIN
+                IF TG_OP='UPDATE' AND NEW.jd_id IS DISTINCT FROM OLD.jd_id THEN
+                    RAISE EXCEPTION 'Responsibility parent is immutable' USING ERRCODE = '23514';
+                END IF;
+                IF TG_OP='DELETE' THEN parent_id := OLD.jd_id; ELSE parent_id := NEW.jd_id; END IF;
+                IF TG_OP<>'UPDATE' OR ROW(NEW.description,NEW.kpi,NEW.item_order,NEW.is_active)
+                        IS DISTINCT FROM ROW(OLD.description,OLD.kpi,OLD.item_order,OLD.is_active) THEN
+                    UPDATE public.job_descriptions SET version=version+1,status='قيد المراجعة',
+                        review_version=NULL,review_hash=NULL,updated_at=CURRENT_TIMESTAMP
+                        WHERE id=parent_id AND edit_batch_token IS NULL;
+                END IF;
+                RETURN NULL;
+            END $body$;
+            REVOKE ALL ON FUNCTION jd_governance.advance_parent_revision() FROM PUBLIC;
+            DROP TRIGGER IF EXISTS hr_child_revision ON public.accountabilities;
+            CREATE TRIGGER hr_child_revision AFTER INSERT OR UPDATE OR DELETE ON public.accountabilities
+                FOR EACH ROW EXECUTE FUNCTION jd_governance.advance_parent_revision();
         ''')
 
 

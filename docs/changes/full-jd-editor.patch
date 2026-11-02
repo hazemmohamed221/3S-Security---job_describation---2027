@@ -1,0 +1,1030 @@
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -17,6 +17,8 @@
+ import utils
+ import auth
+ from roles import JD_EDIT_ROLES, ROLE_LABELS
++from jd_editor import render_full_jd_editor
++from jd_fields import DETAIL_FIELDS
+ from presentation import (ADMIN_PAGES, MEMBER_PAGES, render_table, audit_dataframe, audit_column_config,
+                           format_timestamp, arabic_action, arabic_field, readable_notes)
+ from statuses import CardStatus, InterviewStatus
+@@ -129,6 +131,18 @@
+                             st.rerun()
+                         st.error(message)
+ 
++    if state in (CardStatus.DRAFT, CardStatus.PENDING_REVIEW):
++        render_full_jd_editor(jd, principal, _run_jd_workflow)
++
++
++def render_jd_detail_fields(jd):
++    if any(jd.get(name) for name in DETAIL_FIELDS):
++        st.markdown('#### الهيكل التنظيمي ومتطلبات الوظيفة التفصيلية')
++        for name, label in DETAIL_FIELDS.items():
++            if jd.get(name):
++                st.markdown(f'**{label}**')
++                st.text(jd[name])
++
+ 
+ def render_admin_settings():
+     """Render only for a freshly verified administrator, never a cached UI role."""
+@@ -660,6 +674,7 @@
+ 
+             st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
+             st.write(jd['competencies'] or 'غير مسجلة')
++            render_jd_detail_fields(jd)
+             st.markdown('#### بيانات الاعتماد الواردة في المصدر')
+             st.write(jd['approvals'] or 'غير مسجلة')
+ 
+@@ -967,6 +982,7 @@
+ 
+         st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
+         st.write(jd['competencies'] or 'غير مسجلة')
++        render_jd_detail_fields(jd)
+         st.markdown('#### بيانات الاعتماد الواردة في المصدر')
+         st.write(jd['approvals'] or 'غير مسجلة')
+ 
+diff --git a/database.py b/database.py
+--- a/database.py
++++ b/database.py
+@@ -17,6 +17,8 @@
+ from statuses import CardStatus, ReviewStatus, InterviewStatus, display_status
+ from upload_security import sanitize_docx_filename
+ from roles import USER_ROLES, JD_EDIT_ROLES
++from jd_fields import DETAIL_FIELDS, EDIT_FIELDS, FIELD_ALIASES
++from uuid import uuid4
+ 
+ try:
+     from dotenv import load_dotenv
+@@ -480,6 +482,14 @@
+     ))
+     jd_id = cur.lastrowid
+ 
++    extra = {field: parsed[field] for field in DETAIL_FIELDS if field in parsed}
++    if extra:
++        # This is part of initial import, before any review is bound.
++        cur.execute('UPDATE job_descriptions SET edit_batch_token=? WHERE id=?', (uuid4().hex, jd_id))
++        cur.execute('UPDATE job_descriptions SET ' + ','.join(f'{f}=?' for f in extra) + ' WHERE id=?',
++                    (*extra.values(), jd_id))
++        cur.execute('UPDATE job_descriptions SET edit_batch_token=NULL WHERE id=?', (jd_id,))
++
+     for idx, acc in enumerate(parsed.get('accountabilities', [])):
+         cur.execute("""
+         INSERT INTO accountabilities (jd_id, item_order, description, kpi, version, is_active)
+@@ -674,7 +684,8 @@
+         actor = _require_actor(conn, actor_id, admin=True)
+         if parsed_jd.get('format_version') == 2:
+             import_hash = governance.digest(governance.encode({
+-                'fields': {f: parsed_jd.get(f) or '' for f in governance.CONTENT_FIELDS if f != 'source_file'},
++                'fields': {f: parsed_jd.get(f) or '' for f in governance.CONTENT_FIELDS if f != 'source_file'
++                           and not (f in DETAIL_FIELDS and not parsed_jd.get(f))},
+                 'accountabilities': parsed_jd.get('accountabilities', []),
+             }))
+             existing = conn.execute('SELECT * FROM job_descriptions WHERE id=?',
+@@ -914,6 +925,98 @@
+     return True, 'تم تحديث بيانات البطاقة وتسجيل التعديلات بنجاح.'
+ 
+ 
++def update_jd_full_details(card_id: int, actor_id: int, actor_name: str, core_fields: dict,
++                           responsibilities: list[dict], *, expected_version=None) -> tuple[bool, str]:
++    """Save one complete editable revision, archiving removed responsibilities.
++
++    core_fields is partial; responsibilities is the complete desired active list.
++    IDs identify existing active rows on this card only. New rows omit id.
++    """
++    try:
++        with _write_connection() as conn:
++            actor, card = _lock_edit_card(conn, card_id, actor_id, expected_version)
++            status = CardStatus.parse(card['status'])
++            if status not in (CardStatus.DRAFT, CardStatus.PENDING_REVIEW):
++                raise ValueError('التعديل الشامل متاح للمسودة أو البطاقة قيد المراجعة. يجب إلغاء الاعتماد أولاً.')
++            if not isinstance(core_fields, dict) or not isinstance(responsibilities, list):
++                raise ValueError('بيانات البطاقة وقائمة المسؤوليات غير صالحة.')
++            fields = {}
++            for key, value in core_fields.items():
++                name = FIELD_ALIASES.get(key, key)
++                if name not in EDIT_FIELDS or name in fields or not isinstance(value, str):
++                    raise ValueError('تتضمن البيانات حقلاً غير مسموح أو قيمة غير صالحة.')
++                if name == 'title' and not value.strip():
++                    raise ValueError('المسمى الوظيفي مطلوب.')
++                fields[name] = value
++            lock = ' FOR UPDATE' if isinstance(conn, PostgresConnectionAdapter) else ''
++            current = [dict(row) for row in conn.execute(
++                'SELECT * FROM accountabilities WHERE jd_id=? AND is_active=1 ORDER BY item_order,id' + lock,
++                (card_id,))]
++            by_id = {row['id']: row for row in current}
++            normalized, seen_ids, seen_orders = [], set(), set()
++            for index, item in enumerate(responsibilities, 1):
++                if not isinstance(item, dict) or set(item) - {'id', 'description', 'kpi', 'item_order'}:
++                    raise ValueError('بيانات المسؤولية غير صالحة.')
++                uid = item.get('id')
++                if uid is not None and (type(uid) is not int or uid not in by_id or uid in seen_ids):
++                    raise ValueError('معرف مسؤولية مكرر أو غير نشط أو لا يتبع هذه البطاقة.')
++                if uid is not None:
++                    seen_ids.add(uid)
++                previous = by_id.get(uid, {})
++                description = item.get('description')
++                kpi = item.get('kpi', previous.get('kpi'))
++                order = item.get('item_order', previous.get('item_order', index))
++                if not isinstance(description, str) or not description.strip():
++                    raise ValueError('نص كل مسؤولية مطلوب. احذف البند الفارغ أو أدخل نصه.')
++                if kpi is not None and not isinstance(kpi, str):
++                    raise ValueError('مؤشر قياس الأداء غير صالح.')
++                if type(order) is not int or order < 1 or order in seen_orders:
++                    raise ValueError('ترتيب المسؤوليات يجب أن يكون أرقاماً موجبة غير مكررة.')
++                seen_orders.add(order)
++                normalized.append({'id': uid, 'description': description, 'kpi': kpi, 'item_order': order})
++            changed_fields = {name: value for name, value in fields.items() if value != card[name]}
++            removed = sorted(set(by_id) - seen_ids)
++            updated = [row for row in normalized if row['id'] is not None and any(
++                row[name] != by_id[row['id']][name] for name in ('description', 'kpi', 'item_order'))]
++            added = [row for row in normalized if row['id'] is None]
++            if not (changed_fields or removed or updated or added):
++                return True, 'لا توجد تغييرات للحفظ.'
++            before = governance.snapshot(conn, card_id)
++            # The marker is visible only within this locked transaction. Ordinary
++            # writes retain the existing per-mutation revision triggers.
++            conn.execute('UPDATE job_descriptions SET edit_batch_token=? WHERE id=?', (uuid4().hex, card_id))
++            if changed_fields:
++                conn.execute('UPDATE job_descriptions SET ' + ','.join(f'{name}=?' for name in changed_fields)
++                             + ' WHERE id=?', (*changed_fields.values(), card_id))
++            for uid in removed:
++                conn.execute('UPDATE accountabilities SET is_active=0,version=version+1 WHERE id=? AND jd_id=?',
++                             (uid, card_id))
++            for row in updated:
++                conn.execute('''UPDATE accountabilities SET description=?,kpi=?,item_order=?,version=version+1
++                    WHERE id=? AND jd_id=? AND is_active=1''',
++                    (row['description'], row['kpi'], row['item_order'], row['id'], card_id))
++            new_ids = []
++            for row in added:
++                cursor = conn.execute('''INSERT INTO accountabilities(jd_id,item_order,description,kpi)
++                    VALUES (?,?,?,?)''', (card_id, row['item_order'], row['description'], row['kpi']))
++                new_ids.append(cursor.lastrowid)
++            conn.execute('''UPDATE job_descriptions SET version=version+1,status=?,edit_batch_token=NULL,
++                review_version=NULL,review_hash=NULL,updated_at=? WHERE id=?''',
++                (status.value, _utc_now(), card_id))
++            notes = governance.encode({
++                'الحقول المعدلة': {name: EDIT_FIELDS[name] for name in changed_fields},
++                'المسؤوليات': {'معدلة': [row['id'] for row in updated], 'مضافة': new_ids, 'محذوفة من العرض': removed},
++            })
++            after = governance.snapshot(conn, card_id)
++            _audit_direct_change(conn, card_id, actor, 'full_update', 'تعديل شامل لبطاقة الوصف الوظيفي',
++                governance.encode({'fields': {name: card[name] for name in changed_fields}, 'responsibilities': current}),
++                governance.encode({'fields': changed_fields, 'responsibilities': [
++                    row for row in after['accountabilities'] if row['is_active']]}), notes, before)
++    except (PermissionError, ValueError) as exc:
++        return False, str(exc)
++    return True, 'تم حفظ التعديل الشامل وتوثيق الإصدار الجديد. يلزم إرسال الإصدار المعدل للمراجعة قبل الاعتماد.'
++
++
+ def request_jd_review(jd_id, *, actor_id):
+     with _write_connection() as conn:
+         _require_actor(conn, actor_id, jd_id=jd_id)
+diff --git a/governance.py b/governance.py
+--- a/governance.py
++++ b/governance.py
+@@ -2,12 +2,14 @@
+ import hashlib
+ import json
+ from statuses import CardStatus, ALIASES, install_constraints
++from jd_fields import DETAIL_FIELDS
+ 
+ CONTENT_FIELDS = (
+     'job_code', 'title', 'department', 'sector', 'reports_to', 'purpose',
+     'dimensions', 'frameworks', 'qualifications', 'competencies', 'hazards',
+     'safe_practices', 'internal_relations', 'external_relations', 'approvals',
+     'source_file',
++    *DETAIL_FIELDS,
+ )
+ STATUS_ALIASES = {key: status.value for key, status in ALIASES[CardStatus].items()}
+ 
+@@ -34,7 +36,9 @@
+ 
+ 
+ def content_hash(state):
+-    card = {k: v for k, v in state['card'].items() if k not in ('status', 'version')}
++    # Empty additive fields must not invalidate historical approvals/review hashes.
++    card = {k: v for k, v in state['card'].items() if k not in ('status', 'version')
++            and not (k in DETAIL_FIELDS and v in (None, ''))}
+     return digest(encode({'card': card, 'accountabilities': state['accountabilities']}))
+ 
+ 
+@@ -51,7 +55,8 @@
+     have no provable base revision and must be rejected/resubmitted to be accepted.
+     """
+     additions = {
+-        'job_descriptions': {'review_version': 'INTEGER', 'review_hash': 'TEXT', 'import_hash': 'TEXT'},
++        'job_descriptions': {'review_version': 'INTEGER', 'review_hash': 'TEXT', 'import_hash': 'TEXT',
++                             **{name: 'TEXT' for name in DETAIL_FIELDS}, 'edit_batch_token': 'TEXT'},
+         'modification_requests': {
+             'expected_version': 'INTEGER', 'expected_hash': 'TEXT', 'requested_snapshot': 'TEXT',
+         },
+@@ -80,7 +85,8 @@
+ 
+     dirty = ' OR '.join(f'NEW.{f} IS NOT OLD.{f}' for f in CONTENT_FIELDS)
+     trigger('stage2_card_revision',
+-            f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions WHEN {dirty}',
++            f'AFTER UPDATE OF {",".join(CONTENT_FIELDS)} ON job_descriptions '
++            f'WHEN NEW.edit_batch_token IS NULL AND ({dirty})',
+             "UPDATE job_descriptions SET version=OLD.version+1,status=CASE "
+             "WHEN OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة' AND NEW.version=OLD.version+1 "
+             "THEN 'مسودة' ELSE 'قيد المراجعة' END,"
+@@ -92,6 +98,8 @@
+         ('UPDATE', 'NEW', ' WHEN ' + ' OR '.join(
+             f'NEW.{f} IS NOT OLD.{f}' for f in ('description', 'kpi', 'item_order', 'is_active'))),
+     ):
++        batching = f'(SELECT edit_batch_token FROM job_descriptions WHERE id={ref}.jd_id) IS NULL'
++        condition = f' WHEN {batching}' + (f' AND ({condition.removeprefix(" WHEN ")})' if condition else '')
+         trigger(f'stage2_child_{event.lower()}', f'AFTER {event} ON accountabilities{condition}',
+                 "UPDATE job_descriptions SET version=version+1,status='قيد المراجعة',review_version=NULL,review_hash=NULL,"
+                 f"updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id={ref}.jd_id;")
+diff --git a/docx_format.py b/docx_format.py
+--- a/docx_format.py
++++ b/docx_format.py
+@@ -8,8 +8,10 @@
+ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+ from docx.oxml import OxmlElement
+ from docx.oxml.ns import qn
++from jd_fields import DETAIL_FIELDS
+ 
+ FORMAT = '3S-JD/v2'
++DETAIL_FORMAT = '3S-JD/details-v1'
+ PROFILE = (
+     ('job_code', 'كود الوظيفة'), ('title', 'المسمى الوظيفي'),
+     ('department', 'الإدارة'), ('sector', 'القطاع'), ('reports_to', 'المسؤول المباشر'),
+@@ -116,8 +118,12 @@
+                     raise ValueError('تكرار حقل في قالب Word.')
+                 fields[key] = docx.text.paragraph.Paragraph(paragraph, doc).text
+     required = {k for k, _ in (*PROFILE, *SECTIONS)} | {'portal_card_id', 'version', 'status'}
++    if DETAIL_FORMAT in (doc.core_properties.keywords or ''):
++        required.update(DETAIL_FIELDS)
+     if not required.issubset(fields):
+         raise ValueError('قالب Word غير مكتمل. أعد التصدير مع الحفاظ على أقسام الوثيقة.')
++    for key in DETAIL_FIELDS:
++        fields.setdefault(key, '')
+     tables = [t for t in doc.tables if t._tbl.tblPr.find(qn('w:tblCaption')) is not None and
+               t._tbl.tblPr.find(qn('w:tblCaption')).get(qn('w:val')) == '3SJD2:accountabilities']
+     if len(tables) != 1:
+@@ -143,6 +149,9 @@
+ def export_jd_to_docx(jd_data, accountabilities, approval_metadata=None):
+     doc = docx.Document()
+     doc.core_properties.identifier = FORMAT
++    detailed = any(jd_data.get(key) not in (None, '') for key in DETAIL_FIELDS)
++    if detailed:
++        doc.core_properties.keywords = DETAIL_FORMAT
+     section = doc.sections[0]
+     section.left_margin = section.right_margin = Inches(.7)
+     section.page_width, section.page_height = Inches(8.27), Inches(11.69)
+@@ -171,7 +180,8 @@
+         field(p, key, value, number)
+ 
+     profile = table(doc, ('بيانات الوظيفة والحوكمة', 'القيمة المسجلة'), (2.2, 4.6), '3SJD2:profile')
+-    for key, label in (*PROFILE, ('portal_card_id', 'معرف البطاقة في المنصة'),
++    profile_details = tuple((key, DETAIL_FIELDS[key]) for key in ('subordinates', 'job_grade')) if detailed else ()
++    for key, label in (*PROFILE, *profile_details, ('portal_card_id', 'معرف البطاقة في المنصة'),
+                        ('version', 'الإصدار'), ('status', 'حالة الوثيقة')):
+         cells = profile.add_row().cells
+         cells[0].text = label
+@@ -179,6 +189,12 @@
+     for key, heading in SECTIONS:
+         rtl(doc.add_heading(heading, 2))
+         put(doc.add_paragraph(), key, jd_data.get(key, ''))
++        extra = ('working_conditions',) if key == 'purpose' else (
++            ('education', 'experience', 'certifications', 'languages', 'skills') if key == 'qualifications' else ())
++        if detailed:
++            for name in extra:
++                rtl(doc.add_heading(DETAIL_FIELDS[name], 2))
++                put(doc.add_paragraph(), name, jd_data.get(name, ''))
+         if key == 'dimensions':
+             rtl(doc.add_heading('المسؤوليات ومؤشرات قياس الأداء', 2))
+             acc_table = table(doc, ('م', 'بيان المسؤولية والواجب الوظيفي', 'مؤشر قياس الأداء'),
+diff --git a/presentation.py b/presentation.py
+--- a/presentation.py
++++ b/presentation.py
+@@ -25,6 +25,7 @@
+                  'reports_to': 'المسؤول المباشر', 'status': 'الحالة', 'version': 'الإصدار',
+                  'created_at': 'تاريخ الإنشاء', 'updated_at': 'تاريخ التحديث'}
+ ACTION_LABELS = {
++    'full update': 'تعديل شامل لبطاقة الوصف الوظيفي',
+     'revoke approval': 'إلغاء الاعتماد وإعادة البطاقة للمسودة',
+     'update': 'تعديل بيانات', 'direct update': 'تعديل بيانات',
+     'approve': 'اعتماد نهائي', 'approved': 'اعتماد نهائي', 'approved as is': 'اعتماد نهائي دون تعديل',
+diff --git a/scripts/migrate_hr_workflow.py b/scripts/migrate_hr_workflow.py
+--- a/scripts/migrate_hr_workflow.py
++++ b/scripts/migrate_hr_workflow.py
+@@ -8,6 +8,7 @@
+ from contextlib import closing
+ 
+ import governance
++from jd_fields import DETAIL_FIELDS
+ 
+ 
+ def install_postgres_guards(conn):
+@@ -17,6 +18,8 @@
+     new = old.replace('OLD.', 'NEW.')
+     dirty = ' OR '.join(f'NEW.{field} IS DISTINCT FROM OLD.{field}' for field in governance.CONTENT_FIELDS)
+     with conn.cursor() as cur:
++        for name in (*DETAIL_FIELDS, 'edit_batch_token'):
++            cur.execute(f'ALTER TABLE public.job_descriptions ADD COLUMN IF NOT EXISTS {name} TEXT')
+         cur.execute(f'''
+             CREATE SCHEMA IF NOT EXISTS jd_governance;
+             REVOKE ALL ON SCHEMA jd_governance FROM PUBLIC;
+@@ -30,7 +33,7 @@
+                 IF NEW.version < OLD.version THEN
+                     RAISE EXCEPTION 'Revision cannot decrease' USING ERRCODE = '23514';
+                 END IF;
+-                IF {dirty} THEN
++                IF NEW.edit_batch_token IS NULL AND ({dirty}) THEN
+                     IF NOT (OLD.status IN ('Draft','مسودة') AND NEW.status='مسودة'
+                             AND NEW.version=OLD.version+1) THEN
+                         NEW.status := 'قيد المراجعة';
+@@ -66,6 +69,27 @@
+             DROP TRIGGER IF EXISTS hr_audit_immutable ON public.jd_audit_trail;
+             CREATE TRIGGER hr_audit_immutable BEFORE UPDATE OR DELETE ON public.jd_audit_trail
+                 FOR EACH ROW EXECUTE FUNCTION jd_governance.guard_audit_evidence();
++
++            CREATE OR REPLACE FUNCTION jd_governance.advance_parent_revision()
++            RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = '' AS $body$
++            DECLARE parent_id integer;
++            BEGIN
++                IF TG_OP='UPDATE' AND NEW.jd_id IS DISTINCT FROM OLD.jd_id THEN
++                    RAISE EXCEPTION 'Responsibility parent is immutable' USING ERRCODE = '23514';
++                END IF;
++                IF TG_OP='DELETE' THEN parent_id := OLD.jd_id; ELSE parent_id := NEW.jd_id; END IF;
++                IF TG_OP<>'UPDATE' OR ROW(NEW.description,NEW.kpi,NEW.item_order,NEW.is_active)
++                        IS DISTINCT FROM ROW(OLD.description,OLD.kpi,OLD.item_order,OLD.is_active) THEN
++                    UPDATE public.job_descriptions SET version=version+1,status='قيد المراجعة',
++                        review_version=NULL,review_hash=NULL,updated_at=CURRENT_TIMESTAMP
++                        WHERE id=parent_id AND edit_batch_token IS NULL;
++                END IF;
++                RETURN NULL;
++            END $body$;
++            REVOKE ALL ON FUNCTION jd_governance.advance_parent_revision() FROM PUBLIC;
++            DROP TRIGGER IF EXISTS hr_child_revision ON public.accountabilities;
++            CREATE TRIGGER hr_child_revision AFTER INSERT OR UPDATE OR DELETE ON public.accountabilities
++                FOR EACH ROW EXECUTE FUNCTION jd_governance.advance_parent_revision();
+         ''')
+ 
+ 
+diff --git a/scripts/migrate_to_supabase.py b/scripts/migrate_to_supabase.py
+--- a/scripts/migrate_to_supabase.py
++++ b/scripts/migrate_to_supabase.py
+@@ -144,6 +144,11 @@
+ CREATE INDEX IF NOT EXISTS idx_audit_trail_jd ON jd_audit_trail(jd_id, changed_at);
+ """
+ 
++from jd_fields import DETAIL_FIELDS
++SCHEMA_SQL += '\n'.join(
++    f'ALTER TABLE public.job_descriptions ADD COLUMN IF NOT EXISTS {name} TEXT;'
++    for name in (*DETAIL_FIELDS, 'edit_batch_token'))
++
+ TABLE_ORDER = [
+     "users",
+     "job_descriptions",
+diff --git a/tests/test_revoke_and_edit_jd.py b/tests/test_revoke_and_edit_jd.py
+--- a/tests/test_revoke_and_edit_jd.py
++++ b/tests/test_revoke_and_edit_jd.py
+@@ -39,9 +39,13 @@
+                 for table in TABLE_ORDER:
+                     cols = [r[1] for r in src.execute(f'PRAGMA table_info({table})')]
+                     for row in src.execute(f'SELECT * FROM {table}'):
++                        if table == 'job_descriptions':
++                            row = list(row)
++                            row[cols.index('edit_batch_token')] = 'synthetic-fixture-load'
+                         cur.execute(f'INSERT INTO {table} ({",".join(cols)}) VALUES ({",".join(["%s"] * len(cols))})', row)
+                     cur.execute(f"SELECT setval(pg_get_serial_sequence('{table}','id'),"
+                                 f"COALESCE((SELECT max(id) FROM {table}),1))")
++            cur.execute('UPDATE job_descriptions SET edit_batch_token=NULL')
+         install_postgres_guards(conn)
+     monkeypatch.setattr(database, 'get_connection', lambda: database.PostgresConnectionAdapter(connect()))
+     return db
+diff --git a/jd_fields.py b/jd_fields.py
+new file mode 100644
+--- /dev/null
++++ b/jd_fields.py
+@@ -0,0 +1,34 @@
++"""Additive JD detail fields and the public full-editor field allowlist."""
++DETAIL_FIELDS = {
++    'subordinates': 'الوظائف التابعة / المرؤوسون',
++    'job_grade': 'المستوى / الدرجة الوظيفية',
++    'working_conditions': 'ظروف وبيئة العمل',
++    'education': 'المؤهل العلمي',
++    'experience': 'سنوات ونوع الخبرة',
++    'certifications': 'الشهادات المهنية والدورات',
++    'languages': 'اللغات المطلوبة',
++    'skills': 'المهارات المطلوبة',
++}
++EDIT_GROUPS = (
++    ('البيانات العامة والهيكل التنظيمي', (
++        ('title', 'المسمى الوظيفي'), ('job_code', 'كود الوظيفة'),
++        ('department', 'الإدارة'), ('sector', 'القطاع'), ('reports_to', 'الرئيس المباشر'),
++        ('subordinates', DETAIL_FIELDS['subordinates']), ('job_grade', DETAIL_FIELDS['job_grade']),
++        ('dimensions', 'أبعاد الوظيفة والنطاق الإشرافي'),
++        ('approvals', 'بيانات الاعتماد في المصدر (لا تمنح اعتماداً إلكترونياً)'),
++    )),
++    ('الهدف وشروط التأهيل والخبرة', (
++        ('purpose', 'الهدف العام من الوظيفة'), ('working_conditions', DETAIL_FIELDS['working_conditions']),
++        ('education', DETAIL_FIELDS['education']), ('experience', DETAIL_FIELDS['experience']),
++        ('certifications', DETAIL_FIELDS['certifications']), ('languages', DETAIL_FIELDS['languages']),
++        ('qualifications', 'المؤهلات والخبرات المجمعة في المصدر'),
++        ('hazards', 'مخاطر الوظيفة'), ('safe_practices', 'ممارسات السلامة والصحة المهنية'),
++    )),
++    ('المهام والمسؤوليات', (('frameworks', 'إطار العمل وحدود اتخاذ القرارات'),)),
++    ('الجدارات والكفاءات', (
++        ('skills', DETAIL_FIELDS['skills']), ('competencies', 'الجدارات الفنية والسلوكية ومعاييرها'),
++        ('internal_relations', 'العلاقات الداخلية'), ('external_relations', 'العلاقات الخارجية'),
++    )),
++)
++EDIT_FIELDS = {name: label for _, fields in EDIT_GROUPS for name, label in fields}
++FIELD_ALIASES = {'job_title': 'title', 'direct_manager': 'reports_to', 'job_purpose': 'purpose'}
+diff --git a/jd_editor.py b/jd_editor.py
+new file mode 100644
+--- /dev/null
++++ b/jd_editor.py
+@@ -0,0 +1,86 @@
++"""Revision-bound comprehensive Streamlit JD editor; changes remain local until confirmed."""
++from uuid import uuid4
++
++import streamlit as st
++
++import database
++from jd_fields import EDIT_GROUPS
++from roles import JD_EDIT_ROLES
++from statuses import CardStatus
++
++
++def render_full_jd_editor(jd, principal, run_workflow):
++    if principal['role'] not in JD_EDIT_ROLES or CardStatus.parse(jd['status']) not in (
++            CardStatus.DRAFT, CardStatus.PENDING_REVIEW):
++        return
++    token = f"{jd['id']}_{jd['version']}"
++    state_key = f'full_editor_{token}'
++    if st.button('✏️ تعديل شامل لبطاقة الوصف الوظيفي', key=f'full_open_{token}', type='primary'):
++        st.session_state[state_key] = {
++            'nonce': uuid4().hex,
++            'rows': [dict(row, entry_key=uuid4().hex) for row in database.get_accountabilities(jd['id'])],
++        }
++        st.session_state['_jd_action_base'] = {'card_id': jd['id'], 'version': jd['version']}
++        st.session_state.pop(f'core_edit_{token}', None)
++        st.rerun()
++    state = st.session_state.get(state_key)
++    if state is None:
++        return
++    prefix = f"full_{token}_{state['nonce']}"
++    with st.expander('التعديل الشامل لبطاقة الوصف الوظيفي', expanded=True):
++        st.caption(f"تعديل الإصدار {jd['version']}. لا تحفظ الإضافات أو الحذف إلا عند تأكيد الحفظ النهائي.")
++        st.info('تبقى البطاقة في حالتها الحالية. يلزم إرسال الإصدار المعدل للمراجعة قبل الاعتماد. '
++                'تُحفظ المسؤوليات المحذوفة في التاريخ وتختفي من القائمة الحالية.')
++        tabs = st.tabs([label for label, _ in EDIT_GROUPS])
++        values = {}
++        desired = []
++        for tab, (_, fields) in zip(tabs, EDIT_GROUPS):
++            with tab:
++                for name, label in fields:
++                    key = f'{prefix}_{name}'
++                    value = jd.get(name) or ''
++                    if name in ('title', 'job_code', 'department', 'sector', 'reports_to', 'job_grade'):
++                        values[name] = st.text_input(label, value=value, key=key)
++                    else:
++                        values[name] = st.text_area(label, value=value, key=key, height=100)
++                if tab is tabs[2]:
++                    st.markdown('#### المسؤوليات والمهام ومؤشرات قياس الأداء')
++                    if not state['rows']:
++                        st.caption('لا توجد مسؤوليات في القائمة الحالية. يمكنك إضافة بند جديد.')
++                    for index, row in enumerate(state['rows'], 1):
++                        row_prefix = f"{prefix}_{row['entry_key']}"
++                        st.markdown(f'**مسؤولية {index}**')
++                        description = st.text_area(f'نص المسؤولية {index}', value=row['description'],
++                                                   key=f'{row_prefix}_description', height=100)
++                        kpi = st.text_area(f'مؤشر قياس الأداء {index}', value=row.get('kpi') or '',
++                                           key=f'{row_prefix}_kpi', height=68)
++                        order = st.number_input(f'ترتيب المسؤولية {index}', min_value=1,
++                                                value=row['item_order'], step=1, key=f'{row_prefix}_order')
++                        desired.append({'id': row.get('id'), 'description': description,
++                                        'kpi': row.get('kpi') if kpi == (row.get('kpi') or '') else kpi,
++                                        'item_order': order})
++                        if st.button(f'🗑️ حذف المسؤولية {index}', key=f'{row_prefix}_remove'):
++                            state['rows'].remove(row)
++                            st.rerun()
++                        st.divider()
++                    if st.button('➕ إضافة مسؤولية جديدة', key=f'{prefix}_add'):
++                        state['rows'].append({'entry_key': uuid4().hex, 'id': None,
++                            'description': '', 'kpi': '',
++                            'item_order': max((r['item_order'] for r in desired), default=0) + 1})
++                        st.rerun()
++        confirm = st.checkbox('أؤكد حفظ التعديلات على هذا الإصدار', key=f'{prefix}_confirmed')
++        if st.button('💾 حفظ التعديل الشامل', key=f'{prefix}_save', type='primary', disabled=not confirm):
++            fields = {name: value for name, value in values.items() if value != (jd.get(name) or '')}
++            ok, message = run_workflow('update_jd_full_details', jd['id'], principal['id'], principal['full_name'],
++                                       fields, desired, expected_version=jd['version'])
++            if ok:
++                st.session_state.pop(state_key, None)
++                st.session_state.pop('_jd_action_base', None)
++                st.session_state['_jd_edit_flash'] = message
++                st.session_state['_jd_saved_card_id'] = jd['id']
++                st.rerun()
++            st.error(message)
++        if st.button('إلغاء التعديل الشامل', key=f'{prefix}_cancel'):
++            st.session_state.pop(state_key, None)
++            st.session_state.pop('_jd_action_base', None)
++            st.rerun()
+diff --git a/tests/test_full_jd_editor.py b/tests/test_full_jd_editor.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_full_jd_editor.py
+@@ -0,0 +1,308 @@
++"""Full JD editor transactions, role boundaries, additive data, Word parity and UI."""
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing
++import json
++import sqlite3
++
++import docx
++from docx.oxml.ns import qn
++import pytest
++
++import database
++import governance
++from docx_parser import export_jd_to_docx, parse_jd_docx
++from jd_fields import DETAIL_FIELDS, EDIT_FIELDS
++from test_revoke_and_edit_jd import workflow_db, execute, rows, ui_login, button
++
++
++def prepare(status='Draft'):
++    with closing(database.get_connection()) as conn, conn:
++        conn.execute('''INSERT INTO job_descriptions(id,title,status,purpose,edit_batch_token)
++            VALUES(3,'بطاقة شاملة',?,'هدف أصلي','synthetic-seed')''', (status,))
++        for uid, order in ((3, 1), (4, 2)):
++            conn.execute('INSERT INTO accountabilities(id,jd_id,item_order,description,kpi) VALUES(?,3,?,?,?)',
++                         (uid, order, f'مسؤولية {order}', f'مؤشر {order}'))
++        conn.execute('UPDATE job_descriptions SET edit_batch_token=NULL WHERE id=3')
++        if isinstance(conn, database.PostgresConnectionAdapter):
++            for table in ('job_descriptions', 'accountabilities'):
++                conn.execute(f"SELECT setval(pg_get_serial_sequence('{table}','id'),"
++                             f"(SELECT max(id) FROM {table}))")
++        if status in ('Pending Review', 'قيد المراجعة', 'Under Review'):
++            governance.bind_review(conn, 3)
++    return database.get_jd_by_id(3)
++
++
++def active():
++    return [{name: row[name] for name in ('id', 'description', 'kpi', 'item_order')}
++            for row in database.get_accountabilities(3)]
++
++
++def save(fields, responsibilities=None, **kwargs):
++    return database.update_jd_full_details(3, 1, 'اسم غير موثوق', fields,
++        active() if responsibilities is None else responsibilities, **kwargs)
++
++
++def data():
++    return {table: rows(table) for table in ('job_descriptions', 'accountabilities', 'jd_audit_trail')}
++
++
++@pytest.mark.parametrize('status', ['Draft', 'مسودة', 'Pending Review', 'قيد المراجعة', 'Under Review'])
++def test_edit_all_fields_once_in_both_editable_states(workflow_db, sign_in, status):
++    before = prepare(status)
++    sign_in('hr')
++    fields = {name: f'قيمة {label}\nتفاصيل عربية' for name, label in EDIT_FIELDS.items()}
++    assert save(fields, expected_version=before['version'])[0]
++    card = database.get_jd_by_id(3)
++    assert all(card[name] == value for name, value in fields.items())
++    assert card['version'] == before['version'] + 1
++    assert card['status'] == governance.canonical_status(status)
++    assert card['review_hash'] is None and card['review_version'] is None and card['edit_batch_token'] is None
++    evidence = database.get_decision_evidence(3)
++    assert len(evidence) == 1 and evidence[0]['action'] == 'full_update'
++    assert evidence[0]['actor_id'] == 1 and evidence[0]['changed_by'] == 'مستخدم 1'
++    assert evidence[0]['changed_at']
++    assert evidence[0]['snapshot_json']['card']['version'] == before['version']
++    assert evidence[0]['result_json']['card']['version'] == card['version']
++    assert set(json.loads(evidence[0]['notes'])['الحقول المعدلة']) == set(fields)
++
++
++@pytest.mark.parametrize('status', ['Approved', 'معتمد', 'Rejected', 'مرفوض'])
++def test_approved_and_rejected_cards_cannot_be_fully_edited(workflow_db, sign_in, status):
++    prepare(status)
++    sign_in('hr')
++    before = data()
++    assert not save({'job_title': 'مرفوض'})[0]
++    assert data() == before
++
++
++@pytest.mark.parametrize('username,uid', [('manager', 2), ('staff', 3)])
++def test_members_cannot_edit_or_impersonate_admin(workflow_db, sign_in, username, uid):
++    prepare()
++    sign_in(username)
++    before = data()
++    assert not database.update_jd_full_details(3, uid, 'مسؤول', {'title': 'غير مصرح'}, active())[0]
++    assert not save({'title': 'انتحال'})[0]
++    assert data() == before
++
++
++@pytest.mark.parametrize('role', ['hr', 'editor'])
++def test_hr_editors_can_edit_unassigned_cards(workflow_db, sign_in, role):
++    prepare()
++    execute('UPDATE users SET role=? WHERE id=2', (role,))
++    sign_in('manager')
++    assert database.update_jd_full_details(3, 2, 'مزور', {'job_title': 'عنوان موارد بشرية'}, active())[0]
++    assert database.get_audit_trail(3)[0]['changed_by'] == 'مستخدم 2'
++
++
++def test_add_update_remove_responsibilities_and_metadata_are_one_revision(workflow_db, sign_in):
++    before = prepare()
++    sign_in('hr')
++    other = database.get_accountabilities(1)
++    desired = [{'id': 3, 'description': 'مهمة محدثة', 'kpi': '100%', 'item_order': 5},
++               {'description': 'مهمة جديدة', 'kpi': 'شهرياً', 'item_order': 7}]
++    assert save({'job_code': '3S-TEST', 'education': 'بكالوريوس'}, desired)[0]
++    card = database.get_jd_by_id(3)
++    assert card['version'] == before['version'] + 1 and card['status'] == 'مسودة'
++    saved = database.get_accountabilities(3)
++    assert saved[0]['id'] == 3 and saved[0]['description'] == 'مهمة محدثة' and saved[0]['version'] == 2
++    assert saved[1]['id'] not in (1, 2, 3, 4) and saved[1]['description'] == 'مهمة جديدة'
++    removed = next(row for row in rows('accountabilities') if row['id'] == 4)
++    assert removed['is_active'] == 0 and removed['description'] == 'مسؤولية 2'
++    assert database.get_accountabilities(1) == other
++    notes = json.loads(database.get_audit_trail(3)[0]['notes'])['المسؤوليات']
++    assert notes == {'معدلة': [3], 'مضافة': [saved[1]['id']], 'محذوفة من العرض': [4]}
++
++
++def test_audit_failure_rolls_back_every_field_and_responsibility(workflow_db, sign_in, monkeypatch):
++    prepare()
++    sign_in('hr')
++    before = data()
++    def fail(*args):
++        raise RuntimeError('synthetic audit unavailable')
++    monkeypatch.setattr(database, '_audit_direct_change', fail)
++    with pytest.raises(RuntimeError):
++        save({'title': 'لن يحفظ', 'languages': 'العربية'}, [{'description': 'إضافة لن تحفظ'}])
++    assert data() == before
++
++
++@pytest.mark.parametrize('fields', [{'id': 1}, {'version': 77}, {'status': 'Approved'},
++                                   {'source_file': 'changed.docx'}, {'title': ''}, {'skills': None},
++                                   {'job_title': 'أ', 'title': 'ب'}, {'title;DROP TABLE users': 'x'}])
++def test_protected_unknown_or_invalid_fields_are_rejected_atomically(workflow_db, sign_in, fields):
++    prepare()
++    sign_in('hr')
++    before = data()
++    assert not save(fields)[0]
++    assert data() == before
++
++
++@pytest.mark.parametrize('desired', [
++    [{'id': 2, 'description': 'بطاقة أخرى'}],
++    [{'id': 3, 'description': 'أ'}, {'id': 3, 'description': 'ب'}],
++    [{'description': ''}], [{'description': 'مهمة', 'kpi': 100}],
++    [{'description': 'أ', 'item_order': 1}, {'description': 'ب', 'item_order': 1}],
++    [{'description': 'أ', 'item_order': 0}], [{'description': 'أ', 'jd_id': 1}],
++    [{'id': '3', 'description': 'أ'}],
++])
++def test_invalid_responsibility_payloads_never_partially_save(workflow_db, sign_in, desired):
++    prepare()
++    sign_in('hr')
++    before = data()
++    assert not save({'title': 'لن يتغير'}, desired)[0]
++    assert data() == before
++
++
++def test_removed_rows_cannot_be_reactivated_by_injected_id(workflow_db, sign_in):
++    prepare()
++    sign_in('hr')
++    assert save({}, [active()[0]])[0]
++    before = data()
++    assert not save({}, [{'id': 4, 'description': 'إعادة غير مصرح بها'}])[0]
++    assert data() == before
++
++
++def test_explicit_empty_list_archives_all_and_noop_is_truly_noop(workflow_db, sign_in):
++    prepare()
++    sign_in('hr')
++    before = data()
++    assert save({})[0] and data() == before
++    assert save({}, [dict(row, kpi=row['kpi']) for row in active()])[0] and data() == before
++    assert save({}, [])[0]
++    assert database.get_accountabilities(3) == []
++    assert len([row for row in rows('accountabilities') if row['jd_id'] == 3]) == 2
++    assert database.get_jd_by_id(3)['version'] == 2
++
++
++def test_stale_or_parallel_saves_cannot_overwrite_newer_revision(workflow_db, sign_in):
++    card = prepare('Pending Review')
++    sign_in('hr')
++    original = active()
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda title: save({'job_title': title}, original,
++            expected_version=card['version']), ('عنوان أ', 'عنوان ب')))
++    assert sum(ok for ok, message in results) == 1
++    assert database.get_jd_by_id(3)['version'] == 2
++    before = data()
++    assert not save({'title': 'نسخة قديمة'}, original, expected_version=card['version'])[0]
++    assert data() == before
++
++
++def test_pending_review_token_and_modification_requests_are_invalidated(workflow_db, sign_in):
++    card = prepare('Pending Review')
++    execute('UPDATE users SET assigned_jd_id=3 WHERE id=2')
++    sign_in('manager')
++    rid = database.submit_modification_request(3, 'Job Purpose', 'purpose', 'هدف أصلي',
++                                               'طلب قديم', 'سبب', actor_id=2)
++    sign_in('hr')
++    assert save({'education': 'مؤهل محدث'})[0]
++    assert not database.review_modification_request(rid, 'Accept', '', actor_id=1)[0]
++    with pytest.raises(ValueError):
++        database.approve_jd_as_is(3, actor_id=1, expected_version=card['version'], expected_hash=card['review_hash'])
++    assert database.review_modification_request(rid, 'Reject', 'طلب إصدار أحدث', actor_id=1)[0]
++    database.request_jd_review(3, actor_id=1)
++    assert database.approve_jd_as_is(3, actor_id=1)
++
++
++def test_empty_additive_columns_preserve_legacy_review_hash(workflow_db, sign_in):
++    prepare('Pending Review')
++    sign_in('hr')
++    with closing(database.get_connection()) as conn:
++        old = governance.snapshot(conn, 3)
++    for name in DETAIL_FIELDS:
++        old['card'].pop(name)
++    legacy_hash = governance.content_hash(old)
++    assert database.get_jd_by_id(3)['review_hash'] == legacy_hash
++    assert database.approve_jd_as_is(3, actor_id=1)
++
++
++def test_structured_details_word_export_import_is_lossless_and_deduplicated(workflow_db, sign_in):
++    prepare()
++    sign_in('hr')
++    fields = {name: f'{label}\nتفاصيل عربية' for name, label in EDIT_FIELDS.items()}
++    assert save(fields)[0]
++    parsed = parse_jd_docx(export_jd_to_docx(*database.get_export_data(3)))
++    assert all(parsed[name] == value for name, value in fields.items())
++    before = data()
++    assert database.create_or_update_jd(parsed, 'same.docx', actor_id=1) == 3
++    assert data() == before
++    parsed['portal_card_id'] = 999
++    imported = database.create_or_update_jd(parsed, 'new.docx', actor_id=1)
++    assert all(database.get_jd_by_id(imported)[name] == value for name, value in fields.items())
++
++
++def test_new_word_detail_markers_are_required_when_extension_is_present(workflow_db, sign_in):
++    prepare()
++    sign_in('hr')
++    assert save({'education': 'بكالوريوس'})[0]
++    doc = docx.Document(export_jd_to_docx(*database.get_export_data(3)))
++    marker = next(b for b in doc.element.body.iter(qn('w:bookmarkStart'))
++                  if b.get(qn('w:name')) == 's3jd2_education')
++    marker.getparent().remove(marker)
++    import io
++    stream = io.BytesIO()
++    doc.save(stream)
++    stream.seek(0)
++    with pytest.raises(ValueError):
++        parse_jd_docx(stream)
++
++
++def ui_prepare(db, status='Draft', role='admin'):
++    prepare(status)
++    if role != 'admin':
++        with sqlite3.connect(db) as conn:
++            conn.execute('UPDATE users SET role=? WHERE id=1', (role,))
++    app = ui_login(db, card_id=3)
++    button(app, '✏️ تعديل شامل لبطاقة الوصف الوظيفي').click().run()
++    assert not app.exception and not app.error
++    return app
++
++
++@pytest.mark.parametrize('status', ['Draft', 'Pending Review'])
++def test_ui_full_editor_tabs_dynamic_rows_and_confirmed_save(db, status):
++    app = ui_prepare(db, status)
++    assert len(app.get('tab')) == 4
++    assert button(app, '💾 حفظ التعديل الشامل').disabled
++    next(w for w in app.text_input if w.label == 'المسمى الوظيفي').input('مدير البطاقة الشاملة')
++    next(w for w in app.text_area if w.label == 'المؤهل العلمي').input('هندسة')
++    next(w for w in app.text_area if w.label == 'نص المسؤولية 1').input('مهمة معدلة')
++    button(app, '➕ إضافة مسؤولية جديدة').click().run()
++    assert next(w for w in app.text_input if w.label == 'المسمى الوظيفي').value == 'مدير البطاقة الشاملة'
++    next(w for w in app.text_area if w.label == 'نص المسؤولية 3').input('مهمة مضافة')
++    button(app, '🗑️ حذف المسؤولية 2').click().run()
++    next(w for w in app.checkbox if w.label == 'أؤكد حفظ التعديلات على هذا الإصدار').check().run()
++    button(app, '💾 حفظ التعديل الشامل').click().run()
++    assert not app.exception and not app.error
++    assert app.selectbox(key='directory_jd_id').value == 3
++    card = database.get_jd_by_id(3)
++    assert card['title'] == 'مدير البطاقة الشاملة' and card['education'] == 'هندسة' and card['version'] == 2
++    assert card['status'] == governance.canonical_status(status)
++    assert [r['description'] for r in database.get_accountabilities(3)] == ['مهمة معدلة', 'مهمة مضافة']
++
++
++@pytest.mark.parametrize('role', ['hr', 'editor'])
++def test_ui_hr_roles_have_full_editor(db, role):
++    app = ui_prepare(db, 'Pending Review', role)
++    assert len(app.get('tab')) == 4
++
++
++def test_ui_cancelling_discards_draft_and_stale_save_requires_reload(db):
++    app = ui_prepare(db)
++    next(w for w in app.text_area if w.label == 'المؤهل العلمي').input('مدخل ملغى')
++    button(app, '➕ إضافة مسؤولية جديدة').click().run()
++    button(app, 'إلغاء التعديل الشامل').click().run()
++    assert database.get_jd_by_id(3)['education'] is None and len(database.get_accountabilities(3)) == 2
++    button(app, '✏️ تعديل شامل لبطاقة الوصف الوظيفي').click().run()
++    assert next(w for w in app.text_area if w.label == 'المؤهل العلمي').value == ''
++    with sqlite3.connect(db) as conn:
++        conn.execute("UPDATE job_descriptions SET education='نسخة أحدث',status='مسودة',version=version+1 WHERE id=3")
++    next(w for w in app.checkbox if w.label == 'أؤكد حفظ التعديلات على هذا الإصدار').check().run()
++    assert any('تغير إصدار' in w.value for w in app.warning)
++    assert not any(b.label == '💾 حفظ التعديل الشامل' for b in app.button)
++    assert database.get_jd_by_id(3)['education'] == 'نسخة أحدث'
++
++
++def test_ui_approved_requires_revocation_first(db):
++    prepare('Approved')
++    app = ui_login(db, card_id=3)
++    assert not any(b.label == '✏️ تعديل شامل لبطاقة الوصف الوظيفي' for b in app.button)
++    assert any(b.label == '🔄 إلغاء الاعتماد وفتح التعديل' for b in app.button)
+diff --git a/docs/FULL_JD_EDITOR.md b/docs/FULL_JD_EDITOR.md
+new file mode 100644
+--- /dev/null
++++ b/docs/FULL_JD_EDITOR.md
+@@ -0,0 +1,181 @@
++# Comprehensive JD editor
++
++Implemented on 2 November 2026 for the existing Python/Streamlit application and
++both SQLite and PostgreSQL adapters. No remote deployment or business-row edits
++were performed as part of this implementation.
++
++## Editing and governance
++
++Authenticated `admin`, `hr`, and `editor` accounts can use **✏️ تعديل شامل لبطاقة
++الوصف الوظيفي** from the directory for Draft or Pending Review cards, including
++their canonical Arabic and legacy English spellings. Approved cards still require
++the existing reason-based revocation first. Rejected cards do not expose direct
++editing. The quick Draft core editor remains available for existing workflows.
++
++The full editor has four internal tabs:
++
++1. General information and reporting structure: title, job code, department,
++   sector, supervisor, subordinates, grade, supervisory dimensions and source
++   approval text. Source approval text does not confer electronic approval.
++2. Purpose, work environment and requirements: purpose, working conditions,
++   education, experience, certifications, languages, the original combined
++   qualification text, hazards and safety practices.
++3. Authority, responsibilities and KPIs: edit each responsibility and its order,
++   add new rows, and remove rows from the active list.
++4. Skills, technical/behavioral competencies and criteria, and internal/external
++   relationships.
++
++New fields use eight additive nullable TEXT columns: `subordinates`, `job_grade`,
++`working_conditions`, `education`, `experience`, `certifications`, `languages`,
++and `skills`. Existing `qualifications`, `dimensions`, competencies and other
++source content are retained without automatic splitting or rewriting.
++
++UI additions/deletions remain unsaved until **أؤكد حفظ التعديلات على هذا الإصدار**
++is checked and **💾 حفظ التعديل الشامل** is clicked. Cancel discards the draft.
++Dynamic rows retain typed values through add/remove reruns. Successful saves retain
++the selected card even when its title, department or filter membership changes.
++The new details are visible in both the HR and assigned-card read-only views.
++
++## API contract and atomicity
++
++```python
++update_jd_full_details(card_id, actor_id, actor_name, core_fields, responsibilities,
++                       *, expected_version=None) -> tuple[bool, str]
++```
++
++`core_fields` is a partial dictionary of editable content fields. The aliases
++`job_title`, `direct_manager`, and `job_purpose` map to the existing `title`,
++`reports_to`, and `purpose` columns. Omitted fields are preserved. Explicit empty
++strings clear optional text; blank titles, unknown/protected fields and non-text
++values are rejected. Identity, status, revision, source-file identity, timestamps
++and governance tokens cannot be supplied through this dictionary.
++
++`responsibilities` is the complete desired active list. Each item contains a
++required nonblank `description`, optional `kpi`, optional positive unique
++`item_order`, and an optional existing `id`. Existing IDs must belong to active
++rows on this card. Omitted KPIs/orders preserve existing values; new orders
++default to the list position. New rows omit `id`. An empty list explicitly removes
++all active responsibilities.
++
++Removed rows are archived with `is_active=0` and retain their IDs/text for audit
++references; they disappear from active reads and Word exports. Updated rows keep
++their IDs and increment their own revision. New rows receive fresh IDs. Duplicate,
++inactive or other-card IDs cannot be injected or reactivated.
++
++Validation, metadata changes, responsibility synchronization, revision advancement
++and one immutable `full_update` audit event commit together. An audit failure
++rolls back every content change, including inserted/archived responsibilities.
++The event records the verified actor ID/name, UTC timestamp, changed fields and
++responsibility IDs, exact before/after text, and hash-verified full snapshots.
++Caller-supplied display names cannot forge attribution.
++
++One successful changed save advances the existing **integer** parent revision
++once, for example 7 → 8, while retaining Draft/Pending Review status. Decimal
++revisions are not introduced into the existing integer schema/Word contract.
++No-op saves add neither a revision nor an audit entry. A private `edit_batch_token`
++column scopes trigger suppression to the locked transaction; ordinary metadata
++and responsibility writes still advance revisions normally. The marker is cleared
++before commit and excluded from content fingerprints and editable payloads.
++
++SQLite serializes writes with `BEGIN IMMEDIATE`; PostgreSQL locks the verified
++account, card and current responsibilities. UI submissions carry their original
++`expected_version`, and stale/concurrent submissions cannot overwrite a newer
++revision. All edits clear the previous review binding. Pending Review status stays
++visible, but approval requires an explicit new review submission through the
++existing review workflow. Existing pending modification requests also become stale.
++
++Empty new columns are omitted from content fingerprints so historical approval
++evidence and review hashes remain valid after the additive migration. Old immutable
++snapshot JSON and recorded decisions are not rewritten.
++
++## Word parity
++
++Word v2 exports include the new structured details whenever any are populated,
++using the existing RTL paragraph/table formatting and visible bookmarked fields.
++The `3S-JD/details-v1` extension marker requires all eight detail bookmarks on
++reimport, so a damaged extended document fails explicitly. Older v2 exports remain
++readable and do not need fabricated detail values. Structured details, Arabic
++newlines, KPIs and existing active-row order survive export/import and deduplication.
++The original combined qualification text remains independent from the new fields.
++
++## Deployment
++
++For an existing PostgreSQL deployment, run the updated idempotent migration with
++the existing server-side `DATABASE_URL`, then reboot/restart Streamlit so every
++Python module is loaded from the same release:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.migrate_hr_workflow --postgres
++```
++
++It adds the columns and updates private invoker triggers for metadata, responsibility
++revisions and immutable audit evidence. It does not add public RPC endpoints,
++change RLS policies or rewrite business records. The normal migration-to-Supabase
++schema also includes the additive columns. Use a database operator account for DDL.
++
++SQLite startup performs its existing verified backup and applies the additive
++migration automatically. The optional explicit SQLite migration command is:
++
++```powershell
++.\.venv\Scripts\python -B -m scripts.migrate_hr_workflow
++```
++
++No schema migration was applied to a remote Supabase project during development.
++Owner-level file/schema access can remove database triggers, as with the existing
++governance model; these are not off-host signed audit archives.
++
++## Files and verification
++
++| File | Change |
++| --- | --- |
++| `database.py` | Full update service; transactional synchronization and detailed evidence; structured Word imports. |
++| `governance.py` | Additive fields, compatible fingerprints and one-revision batching. |
++| `jd_fields.py` | Shared field schema, labels, aliases and editor groups. |
++| `jd_editor.py` | Four-tab dynamic editor with confirmation, cancellation and stable widget identity. |
++| `app.py` | Draft/Pending Review entry point and new detail displays; existing compatibility handling retained. |
++| `docx_format.py` | Backward-compatible structured detail bookmarks and required extension validation. |
++| `presentation.py` | Readable Arabic full-update audit label. |
++| `scripts/migrate_hr_workflow.py` | Additive PostgreSQL columns and transactional revision triggers. |
++| `scripts/migrate_to_supabase.py` | Include new columns when creating/upgrading a migration target. |
++| `tests/test_revoke_and_edit_jd.py` | Preserve seeded revisions while loading the isolated PostgreSQL fixture. |
++| `tests/test_full_jd_editor.py` | 44 backend/UI regressions covering edits, role/state guards, atomicity, concurrency and Word parity. |
++| `docs/FULL_JD_EDITOR.md` | Implementation, deployment and verification record. |
++
++- Repeat pre-flight: **295 passed**. The first unchanged-source pre-flight had
++  an intermittent python-docx style-resolution error in a directory UI test;
++  it did not recur on the repeat or final regression gate.
++- Required final regression command: **347 passed**, no failures/skips, in
++  **60.62 seconds**. All 295 pre-flight cases remain, with eight newly parameterized
++  metadata-revision checks and 44 comprehensive-editor cases. The 170 warnings
++  are upstream Streamlit/importlib metadata deprecations.
++- Real local PostgreSQL 18.4 gate: **75 passed**, 16 UI cases deselected; combines
++  the new full-editor backend cases with the existing HR workflow backend cases.
++  These tests use only the dedicated local `jd_hr_synthetic` database and never
++  the production `DATABASE_URL`. UI cases run on SQLite in the full gate.
++- `pip check`: **No broken requirements found**. No packages were added.
++- Read-only-source migration, idempotence, preservation and exact-restore rehearsal
++  verified all preexisting values/IDs, including **26 cards, 399 responsibilities
++  and 9 interviews**; the source business database stayed unchanged.
++- Browser QA at 1280×720 verified all four Arabic tabs, preserved edits through
++  responsibility addition/removal, mandatory confirmation, and a successful
++  Pending Review save that kept the same card selected and advanced revision
++  1 → 2. Screenshots with synthetic data only:
++  `_stage3_work/hr-jd-edit/full-editor/responsibility-editor.png` and
++  `full-save-success.png`. Temporary QA servers were stopped afterward.
++- The unified patch passes whitespace/application checks and exactly reconstructs
++  all 12 delivered text files from the saved pre-task source baseline.
++
++```powershell
++$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
++.\.venv\Scripts\python -B -m pytest -q
++.\.venv\Scripts\python -m pip check
++
++# Optional dedicated local PostgreSQL gate; never point this at a business database.
++$env:JD_HR_TEST_PG_PORT = '55439'
++.\.venv\Scripts\python -B -m pytest -q tests/test_full_jd_editor.py tests/test_revoke_and_edit_jd.py -k 'not test_ui'
++Remove-Item Env:JD_HR_TEST_PG_PORT
++```
++
++Unified patch: `docs/changes/full-jd-editor.patch`. It is based on the source at
++the start of this task, preserving the already-staged deployment-compatibility fix.
++Business databases, credentials and local test artifacts are excluded.

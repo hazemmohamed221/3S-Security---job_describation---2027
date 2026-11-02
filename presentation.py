@@ -25,6 +25,7 @@ COLUMN_LABELS = {'id': 'المعرف', 'title': 'المسمى الوظيفي', '
                  'reports_to': 'المسؤول المباشر', 'status': 'الحالة', 'version': 'الإصدار',
                  'created_at': 'تاريخ الإنشاء', 'updated_at': 'تاريخ التحديث'}
 ACTION_LABELS = {
+    'full update': 'تعديل شامل لبطاقة الوصف الوظيفي',
     'revoke approval': 'إلغاء الاعتماد وإعادة البطاقة للمسودة',
     'update': 'تعديل بيانات', 'direct update': 'تعديل بيانات',
     'approve': 'اعتماد نهائي', 'approved': 'اعتماد نهائي', 'approved as is': 'اعتماد نهائي دون تعديل',

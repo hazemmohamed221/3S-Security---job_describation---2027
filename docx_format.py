@@ -8,8 +8,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from jd_fields import DETAIL_FIELDS
 
 FORMAT = '3S-JD/v2'
+DETAIL_FORMAT = '3S-JD/details-v1'
 PROFILE = (
     ('job_code', 'كود الوظيفة'), ('title', 'المسمى الوظيفي'),
     ('department', 'الإدارة'), ('sector', 'القطاع'), ('reports_to', 'المسؤول المباشر'),
@@ -116,8 +118,12 @@ def parse_system_document(doc, file_name):
                     raise ValueError('تكرار حقل في قالب Word.')
                 fields[key] = docx.text.paragraph.Paragraph(paragraph, doc).text
     required = {k for k, _ in (*PROFILE, *SECTIONS)} | {'portal_card_id', 'version', 'status'}
+    if DETAIL_FORMAT in (doc.core_properties.keywords or ''):
+        required.update(DETAIL_FIELDS)
     if not required.issubset(fields):
         raise ValueError('قالب Word غير مكتمل. أعد التصدير مع الحفاظ على أقسام الوثيقة.')
+    for key in DETAIL_FIELDS:
+        fields.setdefault(key, '')
     tables = [t for t in doc.tables if t._tbl.tblPr.find(qn('w:tblCaption')) is not None and
               t._tbl.tblPr.find(qn('w:tblCaption')).get(qn('w:val')) == '3SJD2:accountabilities']
     if len(tables) != 1:
@@ -143,6 +149,9 @@ def parse_system_document(doc, file_name):
 def export_jd_to_docx(jd_data, accountabilities, approval_metadata=None):
     doc = docx.Document()
     doc.core_properties.identifier = FORMAT
+    detailed = any(jd_data.get(key) not in (None, '') for key in DETAIL_FIELDS)
+    if detailed:
+        doc.core_properties.keywords = DETAIL_FORMAT
     section = doc.sections[0]
     section.left_margin = section.right_margin = Inches(.7)
     section.page_width, section.page_height = Inches(8.27), Inches(11.69)
@@ -171,7 +180,8 @@ def export_jd_to_docx(jd_data, accountabilities, approval_metadata=None):
         field(p, key, value, number)
 
     profile = table(doc, ('بيانات الوظيفة والحوكمة', 'القيمة المسجلة'), (2.2, 4.6), '3SJD2:profile')
-    for key, label in (*PROFILE, ('portal_card_id', 'معرف البطاقة في المنصة'),
+    profile_details = tuple((key, DETAIL_FIELDS[key]) for key in ('subordinates', 'job_grade')) if detailed else ()
+    for key, label in (*PROFILE, *profile_details, ('portal_card_id', 'معرف البطاقة في المنصة'),
                        ('version', 'الإصدار'), ('status', 'حالة الوثيقة')):
         cells = profile.add_row().cells
         cells[0].text = label
@@ -179,6 +189,12 @@ def export_jd_to_docx(jd_data, accountabilities, approval_metadata=None):
     for key, heading in SECTIONS:
         rtl(doc.add_heading(heading, 2))
         put(doc.add_paragraph(), key, jd_data.get(key, ''))
+        extra = ('working_conditions',) if key == 'purpose' else (
+            ('education', 'experience', 'certifications', 'languages', 'skills') if key == 'qualifications' else ())
+        if detailed:
+            for name in extra:
+                rtl(doc.add_heading(DETAIL_FIELDS[name], 2))
+                put(doc.add_paragraph(), name, jd_data.get(name, ''))
         if key == 'dimensions':
             rtl(doc.add_heading('المسؤوليات ومؤشرات قياس الأداء', 2))
             acc_table = table(doc, ('م', 'بيان المسؤولية والواجب الوظيفي', 'مؤشر قياس الأداء'),

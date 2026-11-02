@@ -39,9 +39,13 @@ def workflow_db(db, session, monkeypatch):
                 for table in TABLE_ORDER:
                     cols = [r[1] for r in src.execute(f'PRAGMA table_info({table})')]
                     for row in src.execute(f'SELECT * FROM {table}'):
+                        if table == 'job_descriptions':
+                            row = list(row)
+                            row[cols.index('edit_batch_token')] = 'synthetic-fixture-load'
                         cur.execute(f'INSERT INTO {table} ({",".join(cols)}) VALUES ({",".join(["%s"] * len(cols))})', row)
                     cur.execute(f"SELECT setval(pg_get_serial_sequence('{table}','id'),"
                                 f"COALESCE((SELECT max(id) FROM {table}),1))")
+            cur.execute('UPDATE job_descriptions SET edit_batch_token=NULL')
         install_postgres_guards(conn)
     monkeypatch.setattr(database, 'get_connection', lambda: database.PostgresConnectionAdapter(connect()))
     return db

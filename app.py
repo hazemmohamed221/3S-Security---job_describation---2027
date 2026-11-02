@@ -17,6 +17,8 @@ import docx_parser
 import utils
 import auth
 from roles import JD_EDIT_ROLES, ROLE_LABELS
+from jd_editor import render_full_jd_editor
+from jd_fields import DETAIL_FIELDS
 from presentation import (ADMIN_PAGES, MEMBER_PAGES, render_table, audit_dataframe, audit_column_config,
                           format_timestamp, arabic_action, arabic_field, readable_notes)
 from statuses import CardStatus, InterviewStatus
@@ -128,6 +130,18 @@ def render_jd_edit_actions(jd, principal):
                             st.session_state['_jd_saved_card_id'] = jd['id']
                             st.rerun()
                         st.error(message)
+
+    if state in (CardStatus.DRAFT, CardStatus.PENDING_REVIEW):
+        render_full_jd_editor(jd, principal, _run_jd_workflow)
+
+
+def render_jd_detail_fields(jd):
+    if any(jd.get(name) for name in DETAIL_FIELDS):
+        st.markdown('#### الهيكل التنظيمي ومتطلبات الوظيفة التفصيلية')
+        for name, label in DETAIL_FIELDS.items():
+            if jd.get(name):
+                st.markdown(f'**{label}**')
+                st.text(jd[name])
 
 
 def render_admin_settings():
@@ -660,6 +674,7 @@ if user['role'] in JD_EDIT_ROLES:
 
             st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
             st.write(jd['competencies'] or 'غير مسجلة')
+            render_jd_detail_fields(jd)
             st.markdown('#### بيانات الاعتماد الواردة في المصدر')
             st.write(jd['approvals'] or 'غير مسجلة')
 
@@ -967,6 +982,7 @@ else:
 
         st.markdown('#### الجدارات والكفاءات والمعايير السلوكية والفنية')
         st.write(jd['competencies'] or 'غير مسجلة')
+        render_jd_detail_fields(jd)
         st.markdown('#### بيانات الاعتماد الواردة في المصدر')
         st.write(jd['approvals'] or 'غير مسجلة')
 
