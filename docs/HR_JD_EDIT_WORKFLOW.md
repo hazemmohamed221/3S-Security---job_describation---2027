@@ -53,6 +53,27 @@ authentication, integer revision numbers, Arabic statuses and Word format remain
 
 ## Deployment
 
+### Cloud deployment troubleshooting
+
+An `AttributeError` at `database.revoke_jd_approval` or
+`database.update_jd_core_info` happens before the database operation starts.
+It indicates that the imported Python module does not expose the requested
+function; a database schema migration does not resolve this Python error.
+The functions are present in GitHub main at commit `04f7007`.
+
+If the running app still reports them missing, verify its configured repository,
+branch and entry point, then use **Manage app → Reboot app** to clear the process
+memory and reload the deployed source. See the official
+[Streamlit reboot instructions](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app/reboot-your-app).
+The UI now reports this mismatch explicitly and stops before writing rather than
+raising an unhandled AttributeError. It does not hot-reload database modules
+while other sessions may hold active connections.
+
+Deployment-compatibility follow-up: **295 tests passed** (293 existing + two
+missing-function UI regressions), and `pip check` reported no broken requirements.
+Both missing-function cases preserve the card and audit trail and show no success
+message. Follow-up patch: `docs/changes/hr-jd-deployment-compatibility.patch`.
+
 For an existing PostgreSQL deployment, run the migration once with the existing
 server-side `DATABASE_URL` configured, then restart Streamlit:
 

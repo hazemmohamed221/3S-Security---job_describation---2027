@@ -379,3 +379,24 @@ def test_ui_revoke_from_filtered_directory_keeps_same_card_open(db):
     assert not app.exception and not app.error
     assert app.selectbox(key='directory_jd_id').value == 0
     assert database.get_jd_by_id(0)['department'] == 'إدارة جديدة'
+
+
+@pytest.mark.parametrize('operation,status', [('revoke_jd_approval', 'Approved'),
+                                            ('update_jd_core_info', 'Draft')])
+def test_ui_old_database_module_reports_deployment_mismatch_without_writes(db, monkeypatch, operation, status):
+    with sqlite3.connect(db) as conn:
+        conn.execute('INSERT INTO job_descriptions(id,title,status) VALUES(0,?,?)', ('بطاقة الاختبار', status))
+    app = ui_login(db, card_id=0)
+    before = database.get_jd_by_id(0), database.get_audit_trail(0)
+    monkeypatch.delattr(database, operation)
+    if operation == 'revoke_jd_approval':
+        button(app, '🔄 إلغاء الاعتماد وفتح التعديل').click().run()
+        next(w for w in app.text_area if w.label == 'سبب إلغاء الاعتماد').input('سبب الاختبار')
+        button(app, 'تأكيد إلغاء الاعتماد').click().run()
+    else:
+        button(app, '✏️ تعديل بيانات البطاقة').click().run()
+        next(w for w in app.text_input if w.label == 'المسمى الوظيفي').input('تعديل لن يحفظ')
+        button(app, 'حفظ بيانات البطاقة').click().run()
+    assert not app.exception and not app.success
+    assert any('إصدار خدمة البيانات' in error.value and 'Reboot app' in error.value for error in app.error)
+    assert before == (database.get_jd_by_id(0), database.get_audit_trail(0))

@@ -35,6 +35,20 @@ def _run_write(operation, *args, **kwargs):
         st.stop()
 
 
+def _run_jd_workflow(operation_name, *args, **kwargs):
+    """A warm deployment can retain an older imported database module."""
+    operation = getattr(database, operation_name, None)
+    if not callable(operation):
+        logging.getLogger(__name__).error(
+            'Deployment mismatch: database.%s is unavailable; loaded module: %s',
+            operation_name, getattr(database, '__file__', 'unknown'))
+        st.error('إصدار خدمة البيانات لا يتوافق مع واجهة التطبيق. لم يتم حفظ أي تغيير. '
+                 'يرجى إبلاغ مسؤول النظام لإعادة تشغيل التطبيق من Manage app → Reboot app '
+                 'والتأكد من نشر ملفات الإصدار نفسه.')
+        st.stop()
+    return _run_write(operation, *args, **kwargs)
+
+
 def render_jd_edit_actions(jd, principal):
     """Confirmed revocation precedes editing; forms are bound to a displayed revision."""
     if principal['role'] not in JD_EDIT_ROLES:
@@ -70,7 +84,7 @@ def render_jd_edit_actions(jd, principal):
                     st.session_state.pop(f'revoke_confirm_{token}', None)
                     st.rerun()
                 if confirm:
-                    ok, message = _run_write(database.revoke_jd_approval, jd['id'], principal['id'],
+                    ok, message = _run_jd_workflow('revoke_jd_approval', jd['id'], principal['id'],
                                               principal['full_name'], reason, expected_version=jd['version'])
                     if ok:
                         st.session_state.pop('_jd_action_base', None)
@@ -105,7 +119,7 @@ def render_jd_edit_actions(jd, principal):
                     if not changes:
                         st.info('لا توجد تغييرات للحفظ.')
                     else:
-                        ok, message = _run_write(database.update_jd_core_info, jd['id'], principal['id'],
+                        ok, message = _run_jd_workflow('update_jd_core_info', jd['id'], principal['id'],
                             principal['full_name'], changes, expected_version=jd['version'])
                         if ok:
                             st.session_state.pop('_jd_action_base', None)
